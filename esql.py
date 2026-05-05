@@ -22,6 +22,7 @@ Environment:
   ES_FORMAT           Output format: psql, json, txt, csv, yaml, ... (default psql)
   ES_INSECURE=1       Skip TLS certificate verification (development only)
   ES_TIMING=1         Print elapsed time after each query (toggle with \\timing)
+  ES_AUTO_KEYWORDS=1  Auto-uppercase ES|QL keywords before execution (default on; set 0 to disable)
 """
 
 from __future__ import annotations
@@ -39,14 +40,197 @@ import urllib.parse
 import urllib.request
 from base64 import b64encode
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.lexers import PygmentsLexer
+    from prompt_toolkit.styles import Style
+except ImportError:
+    PromptSession = None
+    WordCompleter = None
+    FileHistory = None
+    PygmentsLexer = None
+    Style = None
+
+try:
+    from pygments.lexer import RegexLexer
+    from pygments.token import Comment, Keyword, Name, Number, Operator, Punctuation, String, Text
+except ImportError:
+    RegexLexer = None
+    Comment = Keyword = Name = Number = Operator = Punctuation = String = Text = None
+
+
+ESQL_KEYWORDS = (
+    "FROM", "WHERE", "LIMIT", "SORT", "STATS", "EVAL", "KEEP", "DROP", "RENAME",
+    "ROW", "DISSECT", "GROK", "ENRICH", "MV_EXPAND", "CHANGE_POINT", "LOOKUP", "JOIN",
+    "SHOW", "META", "EXPLAIN", "IN", "NOT", "AND", "OR", "BY", "AS", "NULL", "IS",
+    "LIKE", "RLIKE", "MATCH", "CASE", "WHEN", "THEN", "ELSE", "END", "TRUE", "FALSE",
+)
+ESQL_KEYWORDS_SET = set(ESQL_KEYWORDS)
+ESQL_KEYWORD_PATTERN = r"(?i)\b(?:%s)\b" % "|".join(re.escape(keyword) for keyword in ESQL_KEYWORDS)
+
+
+if RegexLexer is not None:
+    class ESQLLexer(RegexLexer):
+        """Small ES|QL lexer for interactive prompt coloring."""
+
+        name = "ESQL"
+        aliases = ["esql"]
+        filenames = ["*.esql"]
+
+        tokens = {
+            "root": [
+                (r"\s+", Text),
+                (r"//.*?$", Comment.Single),
+                (r"/\*.*?\*/", Comment.Multiline),
+                (r'"""(?:.|\n)*?"""', String.Double),
+                (r'"([^"\\]|\\.)*"', String.Double),
+                (r"'([^'\\]|\\.)*'", String.Single),
+                (r"`[^`]*`", Name.Variable),
+                (r"\b\d+(?:\.\d+)?\b", Number),
+                (ESQL_KEYWORD_PATTERN, Keyword),
+                (r"[|,;()]", Punctuation),
+                (r"(==|!=|<=|>=|=|<|>|\+|-|\*|/)", Operator),
+                (r"\$\{[A-Za-z_][A-Za-z_0-9]*\}", Name.Variable),
+                (r"[A-Za-z_][A-Za-z_0-9]*", Name),
+                (r".", Text),
+            ],
+        }
+else:
+    ESQLLexer = None
+
+
+def create_prompt_session() -> object | None:
+    """Create a syntax-highlighting prompt session if dependencies are available."""
+    if PromptSession is None:
+        return None
+    history_file = os.path.expanduser(os.environ.get("ESQL_HISTORY", "~/.esql_history"))
+    kwargs: dict[str, object] = {"history": FileHistory(history_file)} if FileHistory else {}
+    if ESQLLexer is not None and PygmentsLexer is not None and Style is not None:
+        kwargs["lexer"] = PygmentsLexer(ESQLLexer)
+        kwargs["style"] = Style.from_dict(
+            {
+                "keyword": "ansiblue bold",
+                "name.variable": "ansicyan",
+                "string": "ansigreen",
+                "number": "ansimagenta",
+                "operator": "ansiyellow",
+                "punctuation": "ansibrightblack",
+                "comment": "ansibrightblack italic",
+            }
+        )
+    if WordCompleter is not None:
+        slash_commands = [
+            "\\q", "/q", "\\h", "/h", "/?", "\\clear", "/clear", "\\timing",
+            "/timing", "\\autokeywords", "/autokeywords", "\\ak", "/ak", "\\g",
+            "/g", "\\i", "/i", "\\e", "/e", "\\o", "/o", "\\watch", "/watch",
+            "\\set", "/set", "\\unset", "/unset", "\\conninfo", "/conninfo",
+            "\\df", "/df", "\\info", "/info", "\\!",
+        ]
+        kwargs["completer"] = WordCompleter(
+            [*ESQL_KEYWORDS, *slash_commands],
+            ignore_case=True,
+            sentence=True,
+            match_middle=True,
+        )
+        # Keep typing uninterrupted while showing suggestions as you type.
+        kwargs["complete_while_typing"] = True
+    return PromptSession(**kwargs)
+
+
+def uppercase_esql_keywords(text: str) -> str:
+    """Uppercase ES|QL keywords while preserving literals/comments/identifiers."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i + 2)
+            if j == -1:
+                out.append(text[i:])
+                break
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            if j == -1:
+                out.append(text[i:])
+                break
+            out.append(text[i:j + 2])
+            i = j + 2
+            continue
+
+        if ch == '"' and text.startswith('"""', i):
+            j = text.find('"""', i + 3)
+            if j == -1:
+                out.append(text[i:])
+                break
+            out.append(text[i:j + 3])
+            i = j + 3
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            start = i
+            i += 1
+            while i < n:
+                c = text[i]
+                if c == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if c == quote:
+                    i += 1
+                    break
+                i += 1
+            out.append(text[start:i])
+            continue
+
+        if ch == "`":
+            start = i
+            i += 1
+            while i < n and text[i] != "`":
+                i += 1
+            if i < n:
+                i += 1
+            out.append(text[start:i])
+            continue
+
+        if ch.isalpha() or ch == "_":
+            start = i
+            i += 1
+            while i < n and (text[i].isalnum() or text[i] == "_"):
+                i += 1
+            token = text[start:i]
+            out.append(token.upper() if token.upper() in ESQL_KEYWORDS_SET else token)
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
 
 class ESQLClient:
-    def __init__(self, base: str, fmt: str, timeout: float, insecure: bool, timing: bool = False):
+    def __init__(
+        self,
+        base: str,
+        fmt: str,
+        timeout: float,
+        insecure: bool,
+        timing: bool = False,
+        auto_keywords: bool = False,
+    ):
         self.base = base.rstrip("/")
         self.fmt = fmt
         self.timeout = timeout
         self.insecure = insecure
         self.timing = timing
+        self.auto_keywords = auto_keywords
         request_format = "json" if fmt.lower() == "psql" else fmt
         self.url = f"{self.base}/_query?{urllib.parse.urlencode({'format': request_format})}"
         self.context = None
@@ -60,6 +244,8 @@ class ESQLClient:
 
     def execute(self, query: str) -> int:
         query = apply_variables(query, self.variables)
+        if self.auto_keywords:
+            query = uppercase_esql_keywords(query)
         self.last_statement = query
         body = json.dumps({"query": query}).encode("utf-8")
         req = urllib.request.Request(self.url, data=body, method="POST")
@@ -372,12 +558,15 @@ def print_repl_help() -> None:
     print(
         "Tiny ES|QL terminal. End a query with ';' to execute.\n"
         "Use arrow keys for input history.\n"
+        "Syntax coloring is enabled when prompt-toolkit + pygments are installed.\n"
+        "Autocomplete suggestions (keywords/commands) appear while typing when prompt-toolkit is available.\n"
         "  Ctrl+C  Cancel the current input line / multiline buffer, or abort a running query.\n"
         "  /q, \\q, exit, quit  Exit the terminal.\n"
         "Commands (slash forms with / or \\):\n"
         "  \\h, /?              Show this help\n"
         "  \\clear              Reset the current buffer\n"
         "  \\timing             Toggle elapsed-time display\n"
+        "  \\autokeywords       Toggle automatic keyword uppercasing\n"
         "  \\g                  Execute the current buffer (or rerun last statement)\n"
         "  \\i <path>           Include (read & run) a file of ES|QL\n"
         "  \\e                  Edit the current buffer in $EDITOR, then run\n"
@@ -409,6 +598,7 @@ def parse_repl_command(line_stripped: str) -> tuple[str | None, str]:
         "h": "help", "?": "help", "help": "help",
         "clear": "clear", "c": "clear", "reset": "clear",
         "timing": "timing", "t": "timing",
+        "autokeywords": "autokeywords", "ak": "autokeywords",
         "g": "go",
         "i": "include", "include": "include",
         "e": "editor", "edit": "editor", "editor": "editor",
@@ -529,6 +719,7 @@ def _cmd_conninfo(client: ESQLClient) -> None:
         f"  Timeout   {client.timeout}s\n"
         f"  Insecure  {client.insecure}\n"
         f"  Timing    {'on' if client.timing else 'off'}\n"
+        f"  AutoCaps  {'on' if client.auto_keywords else 'off'}\n"
         f"  Auth      {auth_method}{(' (' + user + ')') if user != '-' else ''}\n"
         f"  Output    {client.output_path or 'stdout'}\n"
         f"  Variables {len(client.variables)} set\n"
@@ -636,6 +827,10 @@ def _dispatch_line(client: ESQLClient, line: str, buffer: str, last_status: int)
         client.timing = not client.timing
         print(f"Timing is {'on' if client.timing else 'off'}.")
         return buffer, last_status, False
+    if cmd_kind == "autokeywords":
+        client.auto_keywords = not client.auto_keywords
+        print(f"Auto keyword capitalization is {'on' if client.auto_keywords else 'off'}.")
+        return buffer, last_status, False
     if cmd_kind == "conninfo":
         _cmd_conninfo(client)
         return buffer, last_status, False
@@ -680,14 +875,24 @@ def _dispatch_line(client: ESQLClient, line: str, buffer: str, last_status: int)
 
 
 def run_repl(client: ESQLClient) -> int:
-    setup_readline()
+    session = create_prompt_session()
+    if session is None:
+        setup_readline()
+        if os.environ.get("ESQL_NO_PROMPTKIT_NOTICE", "").lower() not in ("1", "true", "yes"):
+            sys.stderr.write(
+                "Note: install prompt-toolkit and pygments for inline syntax highlighting.\n"
+            )
     print_repl_help()
     buffer = ""
     last_status = 0
 
     while True:
         try:
-            line = input("esql> " if not buffer.strip() else "   > ")
+            prompt = "esql> " if not buffer.strip() else "   > "
+            if session is None:
+                line = input(prompt)
+            else:
+                line = session.prompt(prompt)
         except EOFError:
             print()
             if buffer.strip():
@@ -755,16 +960,40 @@ def main() -> int:
         action="store_true",
         help="Print elapsed time after each query (toggle in REPL with \\timing)",
     )
+    parser.add_argument(
+        "--auto-keywords",
+        dest="auto_keywords",
+        action="store_true",
+        help="Auto-uppercase ES|QL keywords before execution (default on; toggle with \\autokeywords)",
+    )
+    parser.add_argument(
+        "--no-auto-keywords",
+        dest="auto_keywords",
+        action="store_false",
+        help="Disable keyword auto-capitalization",
+    )
+    parser.set_defaults(auto_keywords=None)
     args = parser.parse_args()
 
     insecure = args.insecure or os.environ.get("ES_INSECURE", "").lower() in ("1", "true", "yes")
     timing = args.timing or os.environ.get("ES_TIMING", "").lower() in ("1", "true", "yes")
+    env_auto_keywords = os.environ.get("ES_AUTO_KEYWORDS", "").lower()
+    if args.auto_keywords is None:
+        if env_auto_keywords in ("1", "true", "yes", "on"):
+            auto_keywords = True
+        elif env_auto_keywords in ("0", "false", "no", "off"):
+            auto_keywords = False
+        else:
+            auto_keywords = True
+    else:
+        auto_keywords = args.auto_keywords
     client = ESQLClient(
         base=os.environ.get("ES_URL", "http://127.0.0.1:9200"),
         fmt=args.format,
         timeout=args.timeout,
         insecure=insecure,
         timing=timing,
+        auto_keywords=auto_keywords,
     )
 
     if args.query_file is None and sys.stdin.isatty():

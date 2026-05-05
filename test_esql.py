@@ -332,6 +332,7 @@ def test_parse_repl_command() -> None:
     check("/! shell command", esql.parse_repl_command("/! echo hi") == ("shell", "echo hi"))
     check("\\unset arg", esql.parse_repl_command("\\unset foo") == ("unset", "foo"))
     check("/conninfo no args", esql.parse_repl_command("/conninfo") == ("conninfo", ""))
+    check("\\autokeywords command", esql.parse_repl_command("\\autokeywords") == ("autokeywords", ""))
 
     check("unknown slash kept verbatim", esql.parse_repl_command("/whatever") == ("whatever", ""))
 
@@ -350,6 +351,36 @@ def test_apply_variables() -> None:
 
     out = esql.apply_variables("FROM a | WHERE x = '${name}'", {"name": "bob"})
     check("substitution inside string", out == "FROM a | WHERE x = 'bob'", f"out={out!r}")
+
+
+def test_uppercase_esql_keywords() -> None:
+    section("uppercase_esql_keywords")
+
+    out = esql.uppercase_esql_keywords("from logs | where level == 'info' | limit 5")
+    check(
+        "mixed/lower case keywords capitalized",
+        out == "FROM logs | WHERE level == 'info' | LIMIT 5",
+        f"out={out!r}",
+    )
+
+    out = esql.uppercase_esql_keywords("FrOm logs | wHeRe a in (1,2)")
+    check("in-between case keywords capitalized", out == "FROM logs | WHERE a IN (1,2)", f"out={out!r}")
+
+    out = esql.uppercase_esql_keywords(
+        "from logs // where limit\n| eval s = 'from where' | keep `from`; /* limit */"
+    )
+    check(
+        "strings/comments/backticks preserved",
+        out == "FROM logs // where limit\n| EVAL s = 'from where' | KEEP `from`; /* limit */",
+        f"out={out!r}",
+    )
+
+    out = esql.uppercase_esql_keywords('from logs | eval r = """from | where""" | limit 1')
+    check(
+        "triple-quoted strings preserved",
+        out == 'FROM logs | EVAL r = """from | where""" | LIMIT 1',
+        f"out={out!r}",
+    )
 
 
 def test_e2e_set_and_substitute() -> None:
@@ -420,6 +451,50 @@ def test_e2e_show_functions_via_slash_df() -> None:
         httpd.shutdown()
 
 
+def test_e2e_auto_keywords_env() -> None:
+    section("end-to-end: ES_AUTO_KEYWORDS=1")
+    seen: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8")
+            try:
+                seen.append(json.loads(body).get("query", ""))
+            except Exception:
+                seen.append(body)
+            payload = json.dumps({"columns": [{"name": "n"}], "values": [[1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        env = dict(os.environ)
+        env["ES_URL"] = url
+        env["ES_USER"] = "u"
+        env["ES_PASSWORD"] = "p"
+        env["ES_AUTO_KEYWORDS"] = "1"
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HERE, "esql.py")],
+            input=b"from logs | where level == 'info' | limit 1;\n",
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        check("exit 0", proc.returncode == 0, proc.stderr.decode())
+        check("query was normalized", seen == ["FROM logs | WHERE level == 'info' | LIMIT 1"], f"seen={seen}")
+    finally:
+        httpd.shutdown()
+
+
 def main() -> int:
     test_splitter()
     test_extract_line_col_errors()
@@ -427,12 +502,14 @@ def main() -> int:
     test_print_error_caret()
     test_parse_repl_command()
     test_apply_variables()
+    test_uppercase_esql_keywords()
     test_e2e_success()
     test_e2e_timing_env()
     test_e2e_parse_error_caret()
     test_e2e_multistatement_pipe()
     test_e2e_set_and_substitute()
     test_e2e_show_functions_via_slash_df()
+    test_e2e_auto_keywords_env()
     print(f"\n{PASSED} passed, {FAILED} failed")
     return 0 if FAILED == 0 else 1
 
