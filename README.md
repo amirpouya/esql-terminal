@@ -17,6 +17,7 @@ Tiny psql-style ES|QL terminal for Elasticsearch.
 ./esql.py query.esql      # run a file
 ./esql.py < query.esql    # run from stdin
 ./esql.py --timing        # print elapsed query time
+./esql.py --profile       # send {"profile": true} with each ES|QL request
 ./esql.py --no-auto-keywords  # disable keyword auto-uppercase (enabled by default)
 ```
 
@@ -38,6 +39,7 @@ python3 -m pip install prompt-toolkit pygments
 | `ES_FORMAT` | `psql` | Output format |
 | `ES_INSECURE` | _(unset)_ | `1` to skip TLS verification |
 | `ES_TIMING` | _(unset)_ | `1` to print elapsed time per query |
+| `ES_PROFILE` | _(unset)_ | `1` to send `profile: true` in ES|QL request bodies |
 | `ES_AUTO_KEYWORDS` | `1` | Auto-uppercase ES|QL keywords before execution (`0` disables) |
 | `ESQL_HISTORY` | `~/.esql_history` | Path to history file |
 
@@ -47,9 +49,10 @@ Slash commands work with both `\` and `/` prefixes.
 
 - `\q`/`/q`, `quit`, `exit`: quit REPL
 - `\h`/`/?`: help
-- `\clear`: clear current multiline buffer
+- `\clear`: clear the screen and current multiline buffer
 - `\timing`: toggle elapsed time printing
 - `\autokeywords` (`\ak`): toggle keyword auto-uppercase
+- `\profile` (`\p`): toggle `profile: true` in ES|QL request bodies
 - `\g`: run current buffer (or rerun last statement)
 - `\i <path>`: run statements from a file
 - `\e`: edit current buffer in `$EDITOR`/`$VISUAL`, then run

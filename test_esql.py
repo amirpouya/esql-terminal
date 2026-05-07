@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -253,6 +253,36 @@ def test_e2e_timing_env() -> None:
         httpd.shutdown()
 
 
+def test_e2e_profile_cli() -> None:
+    section("end-to-end: --profile")
+    seen: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8")
+            seen.append(json.loads(body))
+            payload = json.dumps({"columns": [{"name": "n", "type": "long"}], "values": [[1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        proc = run_cli(url, "FROM x;\n", "--profile")
+        check("exit 0", proc.returncode == 0, proc.stderr.decode())
+        check("server saw profile=true", seen == [{"query": "FROM x", "profile": True}], f"seen={seen}")
+    finally:
+        httpd.shutdown()
+
+
 def test_e2e_parse_error_caret() -> None:
     section("end-to-end: parse error caret")
     routes = {
@@ -333,8 +363,21 @@ def test_parse_repl_command() -> None:
     check("\\unset arg", esql.parse_repl_command("\\unset foo") == ("unset", "foo"))
     check("/conninfo no args", esql.parse_repl_command("/conninfo") == ("conninfo", ""))
     check("\\autokeywords command", esql.parse_repl_command("\\autokeywords") == ("autokeywords", ""))
+    check("\\profile command", esql.parse_repl_command("\\profile") == ("profile", ""))
 
     check("unknown slash kept verbatim", esql.parse_repl_command("/whatever") == ("whatever", ""))
+
+
+def test_dispatch_clear_command() -> None:
+    section("dispatch: \\clear")
+    client = esql.ESQLClient("http://127.0.0.1:9200", "psql", 1.0, False)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        new_buffer, status, should_quit = esql._dispatch_line(client, "\\clear", "FROM logs\n", 0)
+    check("buffer reset", new_buffer == "", f"buffer={new_buffer!r}")
+    check("status preserved", status == 0, f"status={status}")
+    check("does not quit", should_quit is False, f"should_quit={should_quit}")
+    check("clear screen sequence emitted", buf.getvalue() == "\x1b[2J\x1b[H", f"out={buf.getvalue()!r}")
 
 
 def test_apply_variables() -> None:
@@ -501,10 +544,12 @@ def main() -> int:
     test_render_query_pointer()
     test_print_error_caret()
     test_parse_repl_command()
+    test_dispatch_clear_command()
     test_apply_variables()
     test_uppercase_esql_keywords()
     test_e2e_success()
     test_e2e_timing_env()
+    test_e2e_profile_cli()
     test_e2e_parse_error_caret()
     test_e2e_multistatement_pipe()
     test_e2e_set_and_substitute()

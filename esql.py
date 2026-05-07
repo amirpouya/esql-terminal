@@ -23,6 +23,7 @@ Environment:
   ES_INSECURE=1       Skip TLS certificate verification (development only)
   ES_TIMING=1         Print elapsed time after each query (toggle with \\timing)
   ES_AUTO_KEYWORDS=1  Auto-uppercase ES|QL keywords before execution (default on; set 0 to disable)
+  ES_PROFILE=1        Send profile=true in the ES|QL request body (toggle with \\profile)
 """
 
 from __future__ import annotations
@@ -126,7 +127,7 @@ def create_prompt_session() -> object | None:
             "/timing", "\\autokeywords", "/autokeywords", "\\ak", "/ak", "\\g",
             "/g", "\\i", "/i", "\\e", "/e", "\\o", "/o", "\\watch", "/watch",
             "\\set", "/set", "\\unset", "/unset", "\\conninfo", "/conninfo",
-            "\\df", "/df", "\\info", "/info", "\\!",
+            "\\profile", "/profile", "\\df", "/df", "\\info", "/info", "\\!",
         ]
         kwargs["completer"] = WordCompleter(
             [*ESQL_KEYWORDS, *slash_commands],
@@ -224,6 +225,7 @@ class ESQLClient:
         insecure: bool,
         timing: bool = False,
         auto_keywords: bool = False,
+        profile: bool = False,
     ):
         self.base = base.rstrip("/")
         self.fmt = fmt
@@ -231,6 +233,7 @@ class ESQLClient:
         self.insecure = insecure
         self.timing = timing
         self.auto_keywords = auto_keywords
+        self.profile = profile
         request_format = "json" if fmt.lower() == "psql" else fmt
         self.url = f"{self.base}/_query?{urllib.parse.urlencode({'format': request_format})}"
         self.context = None
@@ -247,7 +250,10 @@ class ESQLClient:
         if self.auto_keywords:
             query = uppercase_esql_keywords(query)
         self.last_statement = query
-        body = json.dumps({"query": query}).encode("utf-8")
+        payload: dict[str, object] = {"query": query}
+        if self.profile:
+            payload["profile"] = True
+        body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(self.url, data=body, method="POST")
 
         for name, value in build_auth_headers():
@@ -564,9 +570,10 @@ def print_repl_help() -> None:
         "  /q, \\q, exit, quit  Exit the terminal.\n"
         "Commands (slash forms with / or \\):\n"
         "  \\h, /?              Show this help\n"
-        "  \\clear              Reset the current buffer\n"
+        "  \\clear              Clear the screen and reset the current buffer\n"
         "  \\timing             Toggle elapsed-time display\n"
         "  \\autokeywords       Toggle automatic keyword uppercasing\n"
+        "  \\profile            Toggle ES|QL profile=true request option\n"
         "  \\g                  Execute the current buffer (or rerun last statement)\n"
         "  \\i <path>           Include (read & run) a file of ES|QL\n"
         "  \\e                  Edit the current buffer in $EDITOR, then run\n"
@@ -599,6 +606,7 @@ def parse_repl_command(line_stripped: str) -> tuple[str | None, str]:
         "clear": "clear", "c": "clear", "reset": "clear",
         "timing": "timing", "t": "timing",
         "autokeywords": "autokeywords", "ak": "autokeywords",
+        "profile": "profile", "p": "profile",
         "g": "go",
         "i": "include", "include": "include",
         "e": "editor", "edit": "editor", "editor": "editor",
@@ -677,6 +685,11 @@ def _run_statements(client: ESQLClient, text: str) -> tuple[int, str]:
     return last_status, remainder
 
 
+def _cmd_clear() -> None:
+    sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.flush()
+
+
 def _cmd_set(client: ESQLClient, args: str) -> None:
     if not args:
         if not client.variables:
@@ -720,6 +733,7 @@ def _cmd_conninfo(client: ESQLClient) -> None:
         f"  Insecure  {client.insecure}\n"
         f"  Timing    {'on' if client.timing else 'off'}\n"
         f"  AutoCaps  {'on' if client.auto_keywords else 'off'}\n"
+        f"  Profile   {'on' if client.profile else 'off'}\n"
         f"  Auth      {auth_method}{(' (' + user + ')') if user != '-' else ''}\n"
         f"  Output    {client.output_path or 'stdout'}\n"
         f"  Variables {len(client.variables)} set\n"
@@ -822,6 +836,7 @@ def _dispatch_line(client: ESQLClient, line: str, buffer: str, last_status: int)
         print_repl_help()
         return buffer, last_status, False
     if cmd_kind == "clear":
+        _cmd_clear()
         return "", last_status, False
     if cmd_kind == "timing":
         client.timing = not client.timing
@@ -830,6 +845,10 @@ def _dispatch_line(client: ESQLClient, line: str, buffer: str, last_status: int)
     if cmd_kind == "autokeywords":
         client.auto_keywords = not client.auto_keywords
         print(f"Auto keyword capitalization is {'on' if client.auto_keywords else 'off'}.")
+        return buffer, last_status, False
+    if cmd_kind == "profile":
+        client.profile = not client.profile
+        print(f"Profile is {'on' if client.profile else 'off'}.")
         return buffer, last_status, False
     if cmd_kind == "conninfo":
         _cmd_conninfo(client)
@@ -961,6 +980,18 @@ def main() -> int:
         help="Print elapsed time after each query (toggle in REPL with \\timing)",
     )
     parser.add_argument(
+        "--profile",
+        dest="profile",
+        action="store_true",
+        help="Send profile=true in the ES|QL request body (same as ES_PROFILE=1; toggle in REPL with \\profile)",
+    )
+    parser.add_argument(
+        "--no-profile",
+        dest="profile",
+        action="store_false",
+        help="Disable ES|QL profile request option",
+    )
+    parser.add_argument(
         "--auto-keywords",
         dest="auto_keywords",
         action="store_true",
@@ -972,11 +1003,15 @@ def main() -> int:
         action="store_false",
         help="Disable keyword auto-capitalization",
     )
-    parser.set_defaults(auto_keywords=None)
+    parser.set_defaults(auto_keywords=None, profile=None)
     args = parser.parse_args()
 
     insecure = args.insecure or os.environ.get("ES_INSECURE", "").lower() in ("1", "true", "yes")
     timing = args.timing or os.environ.get("ES_TIMING", "").lower() in ("1", "true", "yes")
+    if args.profile is None:
+        profile = os.environ.get("ES_PROFILE", "").lower() in ("1", "true", "yes", "on")
+    else:
+        profile = args.profile
     env_auto_keywords = os.environ.get("ES_AUTO_KEYWORDS", "").lower()
     if args.auto_keywords is None:
         if env_auto_keywords in ("1", "true", "yes", "on"):
@@ -994,6 +1029,7 @@ def main() -> int:
         insecure=insecure,
         timing=timing,
         auto_keywords=auto_keywords,
+        profile=profile,
     )
 
     if args.query_file is None and sys.stdin.isatty():
