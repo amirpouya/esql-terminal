@@ -185,6 +185,16 @@ class FakeESHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        status, body = self.routes.get(path, (404, {"error": {"type": "not_found", "reason": path}}))
+        encoded = json.dumps(body).encode("utf-8") if isinstance(body, dict) else body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
 
 def start_fake_es(routes: dict[str, tuple[int, dict | str]]) -> tuple[HTTPServer, str]:
     FakeESHandler.routes = routes
@@ -283,6 +293,88 @@ def test_e2e_profile_cli() -> None:
         httpd.shutdown()
 
 
+def test_e2e_indices_command() -> None:
+    section("end-to-end: \\indices")
+    routes = {
+        "/_cat/indices": (
+            200,
+            "health status index    uuid pri rep docs.count\n"
+            "green  open   my_index abc  1   0   42\n",
+        )
+    }
+    httpd, url = start_fake_es(routes)
+    try:
+        proc = run_cli(url, "\\indices\n")
+        out = proc.stdout.decode()
+        err = proc.stderr.decode()
+        check("exit 0", proc.returncode == 0, f"rc={proc.returncode} err={err}")
+        check("_cat indices output printed", "my_index" in out and "docs.count" in out, out)
+    finally:
+        httpd.shutdown()
+
+
+def test_e2e_common_api_commands() -> None:
+    section("end-to-end: common API commands")
+    seen: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_GET(self):
+            seen.append(self.path)
+            if self.path.startswith("/_cat/"):
+                payload = "ok\n".encode()
+                content_type = "text/plain"
+            else:
+                payload = json.dumps({"ok": True}).encode()
+                content_type = "application/json"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        script = (
+            "\\health\n"
+            "\\nodes\n"
+            "\\shards wikipedia\n"
+            "\\aliases\n"
+            "\\templates\n"
+            "\\datastreams\n"
+            "\\tasks\n"
+            "\\count wikipedia\n"
+            "\\mapping wikipedia\n"
+            "\\get /_cluster/settings?pretty\n"
+        )
+        proc = run_cli(url, script)
+        out = proc.stdout.decode()
+        check("exit 0", proc.returncode == 0, proc.stderr.decode())
+        check("json response pretty printed", '"ok": true' in out, out)
+        check(
+            "expected REST paths used",
+            seen == [
+                "/_cluster/health?pretty",
+                "/_cat/nodes?v",
+                "/_cat/shards/wikipedia?v",
+                "/_cat/aliases?v",
+                "/_cat/templates?v",
+                "/_cat/data_streams?v",
+                "/_cat/tasks?v",
+                "/wikipedia/_count?pretty=true",
+                "/wikipedia/_mapping?pretty",
+                "/_cluster/settings?pretty",
+            ],
+            f"seen={seen}",
+        )
+    finally:
+        httpd.shutdown()
+
+
 def test_e2e_parse_error_caret() -> None:
     section("end-to-end: parse error caret")
     routes = {
@@ -364,6 +456,12 @@ def test_parse_repl_command() -> None:
     check("/conninfo no args", esql.parse_repl_command("/conninfo") == ("conninfo", ""))
     check("\\autokeywords command", esql.parse_repl_command("\\autokeywords") == ("autokeywords", ""))
     check("\\profile command", esql.parse_repl_command("\\profile") == ("profile", ""))
+    check("\\indices command", esql.parse_repl_command("\\indices") == ("indices", ""))
+    check("\\di indices alias", esql.parse_repl_command("\\di") == ("indices", ""))
+    check("\\health command", esql.parse_repl_command("\\health") == ("health", ""))
+    check("\\nodes command", esql.parse_repl_command("\\nodes") == ("nodes", ""))
+    check("\\ds datastreams alias", esql.parse_repl_command("\\ds") == ("datastreams", ""))
+    check("\\get command", esql.parse_repl_command("\\get /_cluster/health") == ("get", "/_cluster/health"))
 
     check("unknown slash kept verbatim", esql.parse_repl_command("/whatever") == ("whatever", ""))
 
@@ -550,6 +648,8 @@ def main() -> int:
     test_e2e_success()
     test_e2e_timing_env()
     test_e2e_profile_cli()
+    test_e2e_indices_command()
+    test_e2e_common_api_commands()
     test_e2e_parse_error_caret()
     test_e2e_multistatement_pipe()
     test_e2e_set_and_substitute()

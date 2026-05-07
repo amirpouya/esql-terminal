@@ -127,7 +127,11 @@ def create_prompt_session() -> object | None:
             "/timing", "\\autokeywords", "/autokeywords", "\\ak", "/ak", "\\g",
             "/g", "\\i", "/i", "\\e", "/e", "\\o", "/o", "\\watch", "/watch",
             "\\set", "/set", "\\unset", "/unset", "\\conninfo", "/conninfo",
-            "\\profile", "/profile", "\\df", "/df", "\\info", "/info", "\\!",
+            "\\profile", "/profile", "\\indices", "/indices", "\\df", "/df",
+            "\\health", "/health", "\\nodes", "/nodes", "\\shards", "/shards",
+            "\\aliases", "/aliases", "\\templates", "/templates", "\\datastreams",
+            "/datastreams", "\\tasks", "/tasks", "\\count", "/count",
+            "\\mapping", "/mapping", "\\get", "/get", "\\info", "/info", "\\!",
         ]
         kwargs["completer"] = WordCompleter(
             [*ESQL_KEYWORDS, *slash_commands],
@@ -244,6 +248,51 @@ class ESQLClient:
         self.last_statement: str = ""
         self.variables: dict[str, str] = {}
         self.output_path: str | None = None
+
+    def get_api(self, path: str, accept: str = "application/json", pretty_json: bool = False) -> int:
+        if not path.startswith("/"):
+            path = "/" + path
+        url = f"{self.base}{path}"
+        req = urllib.request.Request(url, method="GET")
+
+        for name, value in build_auth_headers():
+            req.add_header(name, value)
+
+        req.add_header("Accept", accept)
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self.context) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            if err_body:
+                print_error(err_body, e.code, self.fmt)
+            else:
+                sys.stderr.write(f"ERROR: HTTP {e.code} {e.reason}\n")
+            return e.code
+        except urllib.error.URLError as e:
+            sys.stderr.write(
+                f"{e}\n\n"
+                "Hints:\n"
+                "  - For https with self-signed certs: ES_INSECURE=1 or --insecure\n"
+                "  - Check ES_URL (include https:// if TLS)\n"
+                "  - Ensure the cluster is running and credentials are correct\n"
+            )
+            return 1
+
+        if pretty_json:
+            try:
+                print(json.dumps(json.loads(raw), indent=2, sort_keys=False))
+            except json.JSONDecodeError:
+                sys.stderr.write("Warning: response was not valid JSON; printing raw body.\n")
+                print(raw.rstrip())
+        else:
+            print(raw.rstrip())
+        return 0
+
+    def cat_indices(self) -> int:
+        params = urllib.parse.urlencode({"v": "true"})
+        return self.get_api(f"/_cat/indices?{params}", accept="text/plain")
 
     def execute(self, query: str) -> int:
         query = apply_variables(query, self.variables)
@@ -582,6 +631,17 @@ def print_repl_help() -> None:
         "  \\set [<name> <val>] Set a substitution variable (used as ${name}); list if no args\n"
         "  \\unset <name>       Remove a substitution variable\n"
         "  \\conninfo           Show current connection settings\n"
+        "  \\indices            List Elasticsearch indexes via _cat/indices\n"
+        "  \\health             Show cluster health\n"
+        "  \\nodes              List cluster nodes\n"
+        "  \\shards [index]     List shard allocation\n"
+        "  \\aliases            List aliases\n"
+        "  \\templates          List index templates\n"
+        "  \\datastreams        List data streams\n"
+        "  \\tasks              List running tasks\n"
+        "  \\count [index]      Count documents\n"
+        "  \\mapping <index>    Show index mappings\n"
+        "  \\get /_path         Run a read-only GET API request\n"
         "  \\df                 Run SHOW FUNCTIONS\n"
         "  \\info               Run SHOW INFO\n"
         "  \\! <cmd>            Run a shell command\n"
@@ -614,6 +674,17 @@ def parse_repl_command(line_stripped: str) -> tuple[str | None, str]:
         "set": "set",
         "unset": "unset",
         "conninfo": "conninfo", "status": "conninfo",
+        "indices": "indices", "indexes": "indices", "di": "indices",
+        "health": "health",
+        "nodes": "nodes",
+        "shards": "shards",
+        "aliases": "aliases",
+        "templates": "templates",
+        "datastreams": "datastreams", "data_streams": "datastreams", "ds": "datastreams",
+        "tasks": "tasks",
+        "count": "count",
+        "mapping": "mapping", "mappings": "mapping",
+        "get": "get",
         "df": "functions", "functions": "functions",
         "info": "info",
         "!": "shell",
@@ -657,9 +728,9 @@ def setup_readline() -> None:
     atexit.register(save_history)
 
 
-def _execute_with_output_redirect(client: ESQLClient, statement: str) -> int:
+def _with_output_redirect(client: ESQLClient, action) -> int:
     if not client.output_path:
-        return client.execute(statement)
+        return action()
     import contextlib
     try:
         handle = open(client.output_path, "a", encoding="utf-8")
@@ -667,7 +738,11 @@ def _execute_with_output_redirect(client: ESQLClient, statement: str) -> int:
         sys.stderr.write(f"Cannot open '{client.output_path}': {exc}\n")
         return 1
     with handle, contextlib.redirect_stdout(handle):
-        return client.execute(statement)
+        return action()
+
+
+def _execute_with_output_redirect(client: ESQLClient, statement: str) -> int:
+    return _with_output_redirect(client, lambda: client.execute(statement))
 
 
 def _run_statements(client: ESQLClient, text: str) -> tuple[int, str]:
@@ -738,6 +813,35 @@ def _cmd_conninfo(client: ESQLClient) -> None:
         f"  Output    {client.output_path or 'stdout'}\n"
         f"  Variables {len(client.variables)} set\n"
     )
+
+
+def _quote_path_part(value: str) -> str:
+    return urllib.parse.quote(value.strip("/"), safe="*,._-+:")
+
+
+def _api_path_with_optional_target(base_path: str, args: str, suffix: str = "", params: dict[str, str] | None = None) -> str:
+    path = base_path
+    target = args.strip()
+    if target:
+        path = f"/{_quote_path_part(target)}{suffix}"
+    query = urllib.parse.urlencode(params or {})
+    return f"{path}?{query}" if query else path
+
+
+def _cmd_get_api(client: ESQLClient, args: str) -> int:
+    path = args.strip()
+    if not path:
+        sys.stderr.write("Usage: \\get /_path\n")
+        return 1
+    return _with_output_redirect(client, lambda: client.get_api(path, pretty_json=True))
+
+
+def _cmd_cat(client: ESQLClient, path: str) -> int:
+    return _with_output_redirect(client, lambda: client.get_api(path, accept="text/plain"))
+
+
+def _cmd_json_get(client: ESQLClient, path: str) -> int:
+    return _with_output_redirect(client, lambda: client.get_api(path, pretty_json=True))
 
 
 def _cmd_output(client: ESQLClient, args: str) -> None:
@@ -881,6 +985,35 @@ def _dispatch_line(client: ESQLClient, line: str, buffer: str, last_status: int)
             return "", last_status, False
         status, leftover = _run_statements(client, target + ";")
         return leftover, status, False
+    if cmd_kind == "indices":
+        return buffer, _with_output_redirect(client, client.cat_indices), False
+    if cmd_kind == "health":
+        return buffer, _cmd_json_get(client, "/_cluster/health?pretty"), False
+    if cmd_kind == "nodes":
+        return buffer, _cmd_cat(client, "/_cat/nodes?v"), False
+    if cmd_kind == "shards":
+        target = cmd_args.strip()
+        path = f"/_cat/shards/{_quote_path_part(target)}?v" if target else "/_cat/shards?v"
+        return buffer, _cmd_cat(client, path), False
+    if cmd_kind == "aliases":
+        return buffer, _cmd_cat(client, "/_cat/aliases?v"), False
+    if cmd_kind == "templates":
+        return buffer, _cmd_cat(client, "/_cat/templates?v"), False
+    if cmd_kind == "datastreams":
+        return buffer, _cmd_cat(client, "/_cat/data_streams?v"), False
+    if cmd_kind == "tasks":
+        return buffer, _cmd_cat(client, "/_cat/tasks?v"), False
+    if cmd_kind == "count":
+        path = _api_path_with_optional_target("/_count", cmd_args, suffix="/_count", params={"pretty": "true"})
+        return buffer, _cmd_json_get(client, path), False
+    if cmd_kind == "mapping":
+        if not cmd_args.strip():
+            sys.stderr.write("Usage: \\mapping <index>\n")
+            return buffer, 1, False
+        path = f"/{_quote_path_part(cmd_args)}/_mapping?pretty"
+        return buffer, _cmd_json_get(client, path), False
+    if cmd_kind == "get":
+        return buffer, _cmd_get_api(client, cmd_args), False
     if cmd_kind == "functions":
         return buffer, _execute_with_output_redirect(client, "SHOW FUNCTIONS"), False
     if cmd_kind == "info":
