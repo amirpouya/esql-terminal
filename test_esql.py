@@ -163,6 +163,26 @@ def test_print_error_caret() -> None:
     check("STATUS line present", "STATUS: 400" in output, output)
 
 
+def test_json_coloring_forced() -> None:
+    section("JSON coloring")
+    old_color = os.environ.get("ESQL_COLOR")
+    os.environ["ESQL_COLOR"] = "1"
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            esql.print_json({"ok": True})
+        out = buf.getvalue()
+        if esql.highlight is None:
+            check("color unavailable without pygments", "\x1b[" not in out and '"ok"' in out, out)
+        else:
+            check("ANSI color emitted when forced", "\x1b[" in out and '"ok"' in out, out)
+    finally:
+        if old_color is None:
+            os.environ.pop("ESQL_COLOR", None)
+        else:
+            os.environ["ESQL_COLOR"] = old_color
+
+
 # ----------------------------------------------------------------------------
 # End-to-end: spin up a fake ES, run esql.py against it, check output & timing.
 # ----------------------------------------------------------------------------
@@ -375,6 +395,39 @@ def test_e2e_common_api_commands() -> None:
         httpd.shutdown()
 
 
+def test_e2e_format_command() -> None:
+    section("end-to-end: \\format")
+    seen: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_POST(self):
+            seen.append(self.path)
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            payload = json.dumps({"columns": [{"name": "n", "type": "long"}], "values": [[1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        proc = run_cli(url, "\\format json\nFROM x;\n")
+        out = proc.stdout.decode()
+        check("exit 0", proc.returncode == 0, proc.stderr.decode())
+        check("format command reported json", "Format is json." in out, out)
+        check("query used json response format", seen == ["/_query?format=json"], f"seen={seen}")
+        check("json output pretty printed", '"columns": [' in out and '"values": [' in out, out)
+    finally:
+        httpd.shutdown()
+
+
 def test_e2e_parse_error_caret() -> None:
     section("end-to-end: parse error caret")
     routes = {
@@ -447,6 +500,7 @@ def test_parse_repl_command() -> None:
     check("/q canonicalized", esql.parse_repl_command("/q") == ("quit", ""))
     check("\\q canonicalized", esql.parse_repl_command("\\q") == ("quit", ""))
     check("/timing alias t", esql.parse_repl_command("/t") == ("timing", ""))
+    check("/format alias f", esql.parse_repl_command("/f json") == ("format", "json"))
 
     check("/i path captured", esql.parse_repl_command("/i ./queries.esql") == ("include", "./queries.esql"))
     check("\\set with spaces", esql.parse_repl_command("\\set name foo bar") == ("set", "name foo bar"))
@@ -476,6 +530,18 @@ def test_dispatch_clear_command() -> None:
     check("status preserved", status == 0, f"status={status}")
     check("does not quit", should_quit is False, f"should_quit={should_quit}")
     check("clear screen sequence emitted", buf.getvalue() == "\x1b[2J\x1b[H", f"out={buf.getvalue()!r}")
+
+
+def test_dispatch_format_command() -> None:
+    section("dispatch: \\format")
+    client = esql.ESQLClient("http://127.0.0.1:9200", "psql", 1.0, False)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        new_buffer, status, should_quit = esql._dispatch_line(client, "\\format json", "FROM logs\n", 0)
+    check("buffer preserved", new_buffer == "FROM logs\n", f"buffer={new_buffer!r}")
+    check("status preserved", status == 0, f"status={status}")
+    check("does not quit", should_quit is False, f"should_quit={should_quit}")
+    check("client format changed", client.fmt == "json" and "format=json" in client.url, f"fmt={client.fmt} url={client.url}")
 
 
 def test_apply_variables() -> None:
@@ -641,8 +707,10 @@ def main() -> int:
     test_extract_line_col_errors()
     test_render_query_pointer()
     test_print_error_caret()
+    test_json_coloring_forced()
     test_parse_repl_command()
     test_dispatch_clear_command()
+    test_dispatch_format_command()
     test_apply_variables()
     test_uppercase_esql_keywords()
     test_e2e_success()
@@ -650,6 +718,7 @@ def main() -> int:
     test_e2e_profile_cli()
     test_e2e_indices_command()
     test_e2e_common_api_commands()
+    test_e2e_format_command()
     test_e2e_parse_error_caret()
     test_e2e_multistatement_pipe()
     test_e2e_set_and_substitute()

@@ -55,9 +55,15 @@ except ImportError:
     Style = None
 
 try:
+    from pygments import highlight
+    from pygments.formatters import TerminalFormatter
+    from pygments.lexers import JsonLexer
     from pygments.lexer import RegexLexer
     from pygments.token import Comment, Keyword, Name, Number, Operator, Punctuation, String, Text
 except ImportError:
+    highlight = None
+    TerminalFormatter = None
+    JsonLexer = None
     RegexLexer = None
     Comment = Keyword = Name = Number = Operator = Punctuation = String = Text = None
 
@@ -124,9 +130,10 @@ def create_prompt_session() -> object | None:
     if WordCompleter is not None:
         slash_commands = [
             "\\q", "/q", "\\h", "/h", "/?", "\\clear", "/clear", "\\timing",
-            "/timing", "\\autokeywords", "/autokeywords", "\\ak", "/ak", "\\g",
-            "/g", "\\i", "/i", "\\e", "/e", "\\o", "/o", "\\watch", "/watch",
-            "\\set", "/set", "\\unset", "/unset", "\\conninfo", "/conninfo",
+            "/timing", "\\format", "/format", "\\f", "/f", "\\autokeywords",
+            "/autokeywords", "\\ak", "/ak", "\\g", "/g", "\\i", "/i", "\\e",
+            "/e", "\\o", "/o", "\\watch", "/watch", "\\set", "/set",
+            "\\unset", "/unset", "\\conninfo", "/conninfo",
             "\\profile", "/profile", "\\indices", "/indices", "\\df", "/df",
             "\\health", "/health", "\\nodes", "/nodes", "\\shards", "/shards",
             "\\aliases", "/aliases", "\\templates", "/templates", "\\datastreams",
@@ -238,8 +245,8 @@ class ESQLClient:
         self.timing = timing
         self.auto_keywords = auto_keywords
         self.profile = profile
-        request_format = "json" if fmt.lower() == "psql" else fmt
-        self.url = f"{self.base}/_query?{urllib.parse.urlencode({'format': request_format})}"
+        self.url = ""
+        self.set_format(fmt)
         self.context = None
         if self.url.lower().startswith("https://") and insecure:
             self.context = ssl.create_default_context()
@@ -248,6 +255,11 @@ class ESQLClient:
         self.last_statement: str = ""
         self.variables: dict[str, str] = {}
         self.output_path: str | None = None
+
+    def set_format(self, fmt: str) -> None:
+        self.fmt = fmt
+        request_format = "json" if fmt.lower() == "psql" else fmt
+        self.url = f"{self.base}/_query?{urllib.parse.urlencode({'format': request_format})}"
 
     def get_api(self, path: str, accept: str = "application/json", pretty_json: bool = False) -> int:
         if not path.startswith("/"):
@@ -282,7 +294,7 @@ class ESQLClient:
 
         if pretty_json:
             try:
-                print(json.dumps(json.loads(raw), indent=2, sort_keys=False))
+                print_json(json.loads(raw))
             except json.JSONDecodeError:
                 sys.stderr.write("Warning: response was not valid JSON; printing raw body.\n")
                 print(raw.rstrip())
@@ -363,6 +375,30 @@ def build_auth_headers() -> list[tuple[str, str]]:
     return [("Authorization", f"Basic {basic}")]
 
 
+def should_color_json() -> bool:
+    color = os.environ.get("ESQL_COLOR", "").lower()
+    if color in ("0", "false", "no", "off", "never"):
+        return False
+    if color in ("1", "true", "yes", "on", "always"):
+        return highlight is not None and JsonLexer is not None and TerminalFormatter is not None
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    return (
+        sys.stdout.isatty()
+        and highlight is not None
+        and JsonLexer is not None
+        and TerminalFormatter is not None
+    )
+
+
+def print_json(payload: object) -> None:
+    text = json.dumps(payload, indent=2, sort_keys=False)
+    if should_color_json():
+        print(highlight(text, JsonLexer(), TerminalFormatter()), end="")
+        return
+    print(text)
+
+
 def print_response(raw: str, fmt: str) -> None:
     if fmt.lower() == "psql":
         try:
@@ -372,7 +408,7 @@ def print_response(raw: str, fmt: str) -> None:
             print(raw)
     elif fmt.lower() == "json":
         try:
-            print(json.dumps(json.loads(raw), indent=2, sort_keys=False))
+            print_json(json.loads(raw))
         except json.JSONDecodeError:
             sys.stderr.write("Warning: response was not valid JSON; printing raw body.\n")
             print(raw)
@@ -620,6 +656,7 @@ def print_repl_help() -> None:
         "Commands (slash forms with / or \\):\n"
         "  \\h, /?              Show this help\n"
         "  \\clear              Clear the screen and reset the current buffer\n"
+        "  \\format [fmt]       Show or change output format (psql, json, txt, csv, yaml, ...)\n"
         "  \\timing             Toggle elapsed-time display\n"
         "  \\autokeywords       Toggle automatic keyword uppercasing\n"
         "  \\profile            Toggle ES|QL profile=true request option\n"
@@ -664,6 +701,7 @@ def parse_repl_command(line_stripped: str) -> tuple[str | None, str]:
         "q": "quit", "quit": "quit", "exit": "quit",
         "h": "help", "?": "help", "help": "help",
         "clear": "clear", "c": "clear", "reset": "clear",
+        "format": "format", "f": "format",
         "timing": "timing", "t": "timing",
         "autokeywords": "autokeywords", "ak": "autokeywords",
         "profile": "profile", "p": "profile",
@@ -815,6 +853,18 @@ def _cmd_conninfo(client: ESQLClient) -> None:
     )
 
 
+def _cmd_format(client: ESQLClient, args: str) -> None:
+    fmt = args.strip()
+    if not fmt:
+        print(f"Format is {client.fmt}.")
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", fmt):
+        sys.stderr.write(f"Invalid format: {fmt!r}\n")
+        return
+    client.set_format(fmt)
+    print(f"Format is {client.fmt}.")
+
+
 def _quote_path_part(value: str) -> str:
     return urllib.parse.quote(value.strip("/"), safe="*,._-+:")
 
@@ -942,6 +992,9 @@ def _dispatch_line(client: ESQLClient, line: str, buffer: str, last_status: int)
     if cmd_kind == "clear":
         _cmd_clear()
         return "", last_status, False
+    if cmd_kind == "format":
+        _cmd_format(client, cmd_args)
+        return buffer, last_status, False
     if cmd_kind == "timing":
         client.timing = not client.timing
         print(f"Timing is {'on' if client.timing else 'off'}.")
