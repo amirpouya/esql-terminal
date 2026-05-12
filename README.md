@@ -10,13 +10,6 @@ Tiny psql-style ES|QL terminal for Elasticsearch.
 - Friendly error formatting for Elasticsearch error responses, including query line/caret pointers for parse errors.
 - Optional prompt coloring and autocomplete (via `prompt-toolkit` + `pygments`).
 
-## Public repository readiness
-
-- No cluster credentials are stored in the repository.
-- Keep local credentials in environment variables or ignored `.env` files.
-- Sample basic-auth defaults are only intended for disposable local Elasticsearch setups.
-- See [`SECURITY.md`](SECURITY.md) for secret-handling guidance.
-
 ## Install
 
 This project is intentionally dependency-light and runs with the Python standard library.
