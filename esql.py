@@ -19,6 +19,7 @@ Environment:
   ES_URL              Base URL (default http://127.0.0.1:9200)
   ES_USER / ES_PASSWORD   Basic auth (defaults elastic / password)
   ES_API_KEY          If set, sends Authorization: ApiKey <base64(id:key)> instead of basic
+  ES_NO_AUTH=1        Skip auth headers entirely for unsecured local/dev clusters
   ES_FORMAT           Output format: psql, json, txt, csv, yaml, ... (default psql)
   ES_INSECURE=1       Skip TLS certificate verification (development only)
   ES_TIMING=1         Print elapsed time after each query (toggle with \\timing)
@@ -33,6 +34,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import ssl
 import sys
 import time
@@ -76,6 +78,10 @@ ESQL_KEYWORDS = (
 )
 ESQL_KEYWORDS_SET = set(ESQL_KEYWORDS)
 ESQL_KEYWORD_PATTERN = r"(?i)\b(?:%s)\b" % "|".join(re.escape(keyword) for keyword in ESQL_KEYWORDS)
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
 
 if RegexLexer is not None:
@@ -234,6 +240,7 @@ class ESQLClient:
         fmt: str,
         timeout: float,
         insecure: bool,
+        no_auth: bool = False,
         timing: bool = False,
         auto_keywords: bool = False,
         profile: bool = False,
@@ -242,6 +249,7 @@ class ESQLClient:
         self.fmt = fmt
         self.timeout = timeout
         self.insecure = insecure
+        self.no_auth = no_auth
         self.timing = timing
         self.auto_keywords = auto_keywords
         self.profile = profile
@@ -267,7 +275,7 @@ class ESQLClient:
         url = f"{self.base}{path}"
         req = urllib.request.Request(url, method="GET")
 
-        for name, value in build_auth_headers():
+        for name, value in build_auth_headers(self.no_auth):
             req.add_header(name, value)
 
         req.add_header("Accept", accept)
@@ -317,7 +325,7 @@ class ESQLClient:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(self.url, data=body, method="POST")
 
-        for name, value in build_auth_headers():
+        for name, value in build_auth_headers(self.no_auth):
             req.add_header(name, value)
 
         req.add_header("Content-Type", "application/json; charset=utf-8")
@@ -359,7 +367,9 @@ def read_query_file(path: str) -> str:
         return handle.read().lstrip("\ufeff").strip()
 
 
-def build_auth_headers() -> list[tuple[str, str]]:
+def build_auth_headers(no_auth: bool = False) -> list[tuple[str, str]]:
+    if no_auth or env_flag("ES_NO_AUTH"):
+        return []
     api_key = os.environ.get("ES_API_KEY")
     if api_key:
         # Accept either the raw "id:secret" form or an already-base64-encoded key.
@@ -835,8 +845,12 @@ def _cmd_unset(client: ESQLClient, args: str) -> None:
 
 
 def _cmd_conninfo(client: ESQLClient) -> None:
-    auth_method = "ApiKey" if os.environ.get("ES_API_KEY") else "Basic"
-    user = os.environ.get("ES_USER", "elastic") if auth_method == "Basic" else "-"
+    if client.no_auth:
+        auth_method = "None"
+        user = "-"
+    else:
+        auth_method = "ApiKey" if os.environ.get("ES_API_KEY") else "Basic"
+        user = os.environ.get("ES_USER", "elastic") if auth_method == "Basic" else "-"
     print(
         "Connection:\n"
         f"  URL       {client.base}\n"
@@ -909,7 +923,13 @@ def _cmd_shell(args: str) -> None:
         return
     import subprocess
     try:
-        subprocess.run(args, shell=True, check=False)
+        if os.name == "nt":
+            shell = os.environ.get("COMSPEC", "cmd.exe")
+            command = [shell, "/c", args]
+        else:
+            shell = os.environ.get("SHELL") or "/bin/sh"
+            command = [shell, "-lc", args]
+        subprocess.run(command, check=False)
     except OSError as exc:
         sys.stderr.write(f"Shell error: {exc}\n")
 
@@ -918,11 +938,18 @@ def _cmd_editor(buffer: str) -> str:
     import subprocess
     import tempfile
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    try:
+        editor_args = shlex.split(editor)
+    except ValueError as exc:
+        sys.stderr.write(f"Invalid editor command {editor!r}: {exc}\n")
+        return buffer
+    if not editor_args:
+        editor_args = ["vi"]
     with tempfile.NamedTemporaryFile("w+", suffix=".esql", delete=False, encoding="utf-8") as tf:
         tf.write(buffer)
         path = tf.name
     try:
-        subprocess.run([*editor.split(), path], check=False)
+        subprocess.run([*editor_args, path], check=False)
         with open(path, "r", encoding="utf-8") as handle:
             return handle.read()
     finally:
@@ -1155,6 +1182,11 @@ def main() -> int:
         help="Skip TLS certificate verification (same as ES_INSECURE=1)",
     )
     parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="Skip auth headers entirely (same as ES_NO_AUTH=1)",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=float(os.environ.get("ES_TIMEOUT", "120")),
@@ -1192,10 +1224,11 @@ def main() -> int:
     parser.set_defaults(auto_keywords=None, profile=None)
     args = parser.parse_args()
 
-    insecure = args.insecure or os.environ.get("ES_INSECURE", "").lower() in ("1", "true", "yes")
-    timing = args.timing or os.environ.get("ES_TIMING", "").lower() in ("1", "true", "yes")
+    insecure = args.insecure or env_flag("ES_INSECURE")
+    no_auth = args.no_auth or env_flag("ES_NO_AUTH")
+    timing = args.timing or env_flag("ES_TIMING")
     if args.profile is None:
-        profile = os.environ.get("ES_PROFILE", "").lower() in ("1", "true", "yes", "on")
+        profile = env_flag("ES_PROFILE")
     else:
         profile = args.profile
     env_auto_keywords = os.environ.get("ES_AUTO_KEYWORDS", "").lower()
@@ -1213,6 +1246,7 @@ def main() -> int:
         fmt=args.format,
         timeout=args.timeout,
         insecure=insecure,
+        no_auth=no_auth,
         timing=timing,
         auto_keywords=auto_keywords,
         profile=profile,

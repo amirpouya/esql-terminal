@@ -10,6 +10,22 @@ Tiny psql-style ES|QL terminal for Elasticsearch.
 - Friendly error formatting for Elasticsearch error responses, including query line/caret pointers for parse errors.
 - Optional prompt coloring and autocomplete (via `prompt-toolkit` + `pygments`).
 
+## Public repository readiness
+
+- No cluster credentials are stored in the repository.
+- Keep local credentials in environment variables or ignored `.env` files.
+- Sample basic-auth defaults are only intended for disposable local Elasticsearch setups.
+- See [`SECURITY.md`](SECURITY.md) for secret-handling guidance.
+
+## Install
+
+This project is intentionally dependency-light and runs with the Python standard library.
+
+```bash
+chmod +x ./esql.py
+python3 ./esql.py --help
+```
+
 ## Usage
 
 ```bash
@@ -18,6 +34,7 @@ Tiny psql-style ES|QL terminal for Elasticsearch.
 ./esql.py < query.esql    # run from stdin
 ./esql.py --timing        # print elapsed query time
 ./esql.py --profile       # send {"profile": true} with each ES|QL request
+./esql.py --no-auth       # talk to an unsecured local cluster without auth headers
 ./esql.py --no-auto-keywords  # disable keyword auto-uppercase (enabled by default)
 ```
 
@@ -41,6 +58,14 @@ The loader uses `ES_USER=elastic` and `ES_PASSWORD=password` by default, matchin
 `esql.py`. If Python has trouble with local CA certificates, the loader still fetches
 Wikipedia with `curl`; set `WIKI_INSECURE=1` only if your environment requires it.
 
+## Development
+
+Run the self-contained test suite:
+
+```bash
+python3 test_esql.py
+```
+
 ## Optional REPL UX dependencies
 
 Install these for inline syntax highlighting and autocomplete while typing:
@@ -56,6 +81,7 @@ python3 -m pip install prompt-toolkit pygments
 | `ES_URL` | `http://127.0.0.1:9200` | Cluster base URL |
 | `ES_USER` / `ES_PASSWORD` | `elastic` / `password` | Basic auth |
 | `ES_API_KEY` | _(unset)_ | Use `ApiKey` auth instead of basic |
+| `ES_NO_AUTH` | _(unset)_ | Skip auth headers for unsecured local clusters |
 | `ES_FORMAT` | `psql` | Output format |
 | `ES_INSECURE` | _(unset)_ | `1` to skip TLS verification |
 | `ES_TIMING` | _(unset)_ | `1` to print elapsed time per query |
