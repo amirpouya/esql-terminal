@@ -691,7 +691,7 @@ def print_repl_help() -> None:
         "  \\get /_path         Run a read-only GET API request\n"
         "  \\df                 Run SHOW FUNCTIONS\n"
         "  \\info               Run SHOW INFO\n"
-        "  \\! <cmd>            Run a shell command via your login shell (trusted input only)\n"
+        "  \\! <cmd>            Run a shell command via your configured shell (trusted input only)\n"
     )
 
 
@@ -928,7 +928,7 @@ def _cmd_shell(args: str) -> None:
             command = [shell, "/c", args]
         else:
             shell = os.environ.get("SHELL") or "/bin/sh"
-            command = [shell, "-lc", args]
+            command = [shell, "-c", args]
         subprocess.run(command, check=False)
     except OSError as exc:
         sys.stderr.write(f"Shell error: {exc}\n")
