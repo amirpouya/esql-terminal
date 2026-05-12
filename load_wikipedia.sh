@@ -6,7 +6,7 @@ set -euo pipefail
 # Defaults target local Elasticsearch and create/index documents into "wikipedia".
 # Configure with:
 #   ES_URL=http://127.0.0.1:9200
-#   ES_USER=elastic ES_PASSWORD=password (default auth when ES_API_KEY is unset)
+#   ES_USER=elastic ES_PASSWORD=password (local-dev default auth when ES_API_KEY is unset)
 #   ES_API_KEY=<base64(id:key)> or <id:key>
 #   ES_NO_AUTH=1
 #   ES_INSECURE=1

@@ -544,6 +544,33 @@ def test_dispatch_format_command() -> None:
     check("client format changed", client.fmt == "json" and "format=json" in client.url, f"fmt={client.fmt} url={client.url}")
 
 
+def test_build_auth_headers() -> None:
+    section("build_auth_headers")
+
+    saved = {name: os.environ.get(name) for name in ("ES_NO_AUTH", "ES_API_KEY", "ES_USER", "ES_PASSWORD")}
+    try:
+        os.environ["ES_NO_AUTH"] = "1"
+        os.environ.pop("ES_API_KEY", None)
+        os.environ.pop("ES_USER", None)
+        os.environ.pop("ES_PASSWORD", None)
+        check("ES_NO_AUTH disables auth headers", esql.build_auth_headers() == [])
+
+        os.environ.pop("ES_NO_AUTH", None)
+        os.environ["ES_API_KEY"] = "id:secret"
+        headers = esql.build_auth_headers()
+        check(
+            "api key form is base64 encoded",
+            headers == [("Authorization", "ApiKey aWQ6c2VjcmV0")],
+            f"headers={headers}",
+        )
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def test_apply_variables() -> None:
     section("apply_variables")
 
@@ -702,6 +729,48 @@ def test_e2e_auto_keywords_env() -> None:
         httpd.shutdown()
 
 
+def test_e2e_no_auth_env() -> None:
+    section("end-to-end: ES_NO_AUTH=1")
+    seen: list[str | None] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_POST(self):
+            seen.append(self.headers.get("Authorization"))
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            payload = json.dumps({"columns": [{"name": "n"}], "values": [[1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        env = dict(os.environ)
+        env["ES_URL"] = url
+        env["ES_NO_AUTH"] = "1"
+        env.pop("ES_API_KEY", None)
+        env.pop("ES_USER", None)
+        env.pop("ES_PASSWORD", None)
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HERE, "esql.py")],
+            input=b"FROM logs | LIMIT 1;\n",
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        check("exit 0", proc.returncode == 0, proc.stderr.decode())
+        check("authorization header omitted", seen == [None], f"seen={seen}")
+    finally:
+        httpd.shutdown()
+
+
 def main() -> int:
     test_splitter()
     test_extract_line_col_errors()
@@ -711,6 +780,7 @@ def main() -> int:
     test_parse_repl_command()
     test_dispatch_clear_command()
     test_dispatch_format_command()
+    test_build_auth_headers()
     test_apply_variables()
     test_uppercase_esql_keywords()
     test_e2e_success()
@@ -724,6 +794,7 @@ def main() -> int:
     test_e2e_set_and_substitute()
     test_e2e_show_functions_via_slash_df()
     test_e2e_auto_keywords_env()
+    test_e2e_no_auth_env()
     print(f"\n{PASSED} passed, {FAILED} failed")
     return 0 if FAILED == 0 else 1
 
