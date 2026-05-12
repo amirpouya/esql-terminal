@@ -121,4 +121,4 @@ Slash commands work with both `\` and `/` prefixes.
 - `\get /_path`: run a read-only Elasticsearch GET API request
 - `\df`: run `SHOW FUNCTIONS`
 - `\info`: run `SHOW INFO`
-- `\! <cmd>`: run shell command
+- `\! <cmd>`: run a shell command via your configured shell (trusted input only)

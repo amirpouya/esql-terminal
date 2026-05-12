@@ -691,7 +691,7 @@ def print_repl_help() -> None:
         "  \\get /_path         Run a read-only GET API request\n"
         "  \\df                 Run SHOW FUNCTIONS\n"
         "  \\info               Run SHOW INFO\n"
-        "  \\! <cmd>            Run a shell command\n"
+        "  \\! <cmd>            Run a shell command via your login shell (trusted input only)\n"
     )
 
 
@@ -941,7 +941,7 @@ def _cmd_editor(buffer: str) -> str:
     try:
         editor_args = shlex.split(editor)
     except ValueError as exc:
-        sys.stderr.write(f"Invalid editor command {editor!r}: {exc}\n")
+        sys.stderr.write(f"Invalid editor command in VISUAL/EDITOR: {exc}\n")
         return buffer
     if not editor_args:
         editor_args = ["vi"]
