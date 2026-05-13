@@ -3,12 +3,14 @@
 Tiny psql-style ES|QL terminal for Elasticsearch.
 
 - Interactive REPL: type/paste multiline ES|QL; complete statements execute on `;`.
+- ES|QL `SET ...;` preambles stay attached to the query that follows.
 - Arrow-key history (persisted to `~/.esql_history`).
 - `Ctrl+C` aborts current input/query and clears buffer instead of exiting the app.
 - Quit with `/q`, `\q`, `quit`, or `exit`.
 - Default output is a psql-style table; `--format json|txt|csv|yaml` also supported.
 - Friendly error formatting for Elasticsearch error responses, including query line/caret pointers for parse errors.
 - Optional prompt coloring and autocomplete (via `prompt-toolkit` + `pygments`).
+- Optional REST request mode for Elasticsearch Dev Tools-style `GET`/`PUT`/`POST` blocks, including `_bulk`.
 
 ## Install
 
@@ -29,6 +31,47 @@ python3 ./esql.py --help
 ./esql.py --profile       # send {"profile": true} with each ES|QL request
 ./esql.py --no-auth       # talk to an unsecured local cluster without auth headers
 ./esql.py --no-auto-keywords  # disable keyword auto-uppercase (enabled by default)
+./esql.py --rest requests.http  # run Elasticsearch REST request blocks
+./esql.py --rest          # start the interactive REPL in REST request mode
+```
+
+## REST request mode
+
+Use `--rest` when a file or stdin contains Elasticsearch API request blocks instead
+of ES|QL statements. Request blocks start with an HTTP method and path; the body is
+read until the next request line. Paths can be written with or without a leading
+slash. `_bulk`, `_msearch`, and `_mget` bodies are sent as newline-delimited JSON.
+
+```bash
+./esql.py --rest < setup.http
+```
+
+In the interactive REPL, use `\rest` to open `$EDITOR`/`$VISUAL`, write or paste
+one or more REST request blocks, and run them when the editor exits. The temp file
+uses a `.http` suffix so editors can apply REST/HTTP syntax highlighting when
+available. You can also start in inline REST mode with `./esql.py --rest`; in that
+mode, paste request blocks directly into the prompt and run the buffer with `\g`.
+
+Example:
+
+```http
+PUT sample_data
+{
+  "mappings": {
+    "properties": {
+      "client_ip": {
+        "type": "ip"
+      },
+      "message": {
+        "type": "keyword"
+      }
+    }
+  }
+}
+
+PUT sample_data/_bulk
+{"index": {}}
+{"@timestamp": "2023-10-23T12:15:03.360Z", "client_ip": "172.21.2.162", "message": "Connected to 10.1.0.3", "event_duration": 3450233}
 ```
 
 ## Load Wikipedia Sample Data
@@ -94,8 +137,9 @@ Slash commands work with both `\` and `/` prefixes.
 - `\timing`: toggle elapsed time printing
 - `\autokeywords` (`\ak`): toggle keyword auto-uppercase
 - `\profile` (`\p`): toggle `profile: true` in ES|QL request bodies
-- `\g`: run current buffer (or rerun last statement)
-- `\i <path>`: run statements from a file
+- `\rest`: edit REST request blocks in `$EDITOR`/`$VISUAL`, then run them
+- `\g`: run current buffer (or rerun last ES|QL/REST input)
+- `\i <path>`: run statements from a file; in REST mode, run REST request blocks
 - `\e`: edit current buffer in `$EDITOR`/`$VISUAL`, then run
 - `\o [<path>]`: redirect output to file (blank to restore stdout)
 - `\watch [secs]`: rerun last query every N seconds

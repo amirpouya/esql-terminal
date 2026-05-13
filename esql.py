@@ -25,6 +25,21 @@ Environment:
   ES_TIMING=1         Print elapsed time after each query (toggle with \\timing)
   ES_AUTO_KEYWORDS=1  Auto-uppercase ES|QL keywords before execution (default on; set 0 to disable)
   ES_PROFILE=1        Send profile=true in the ES|QL request body (toggle with \\profile)
+
+REST request mode:
+
+  ./esql.py --rest requests.http
+  ./esql.py --rest < requests.http
+  ./esql.py --rest
+
+  Input is parsed like Elasticsearch Dev Tools request blocks, for example:
+
+    PUT sample_data
+    { "mappings": { "properties": { "message": { "type": "keyword" } } } }
+
+    PUT sample_data/_bulk
+    {"index": {}}
+    {"message": "hello"}
 """
 
 from __future__ import annotations
@@ -42,6 +57,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from base64 import b64encode
+from dataclasses import dataclass
 
 try:
     from prompt_toolkit import PromptSession
@@ -71,10 +87,11 @@ except ImportError:
 
 
 ESQL_KEYWORDS = (
-    "FROM", "WHERE", "LIMIT", "SORT", "STATS", "EVAL", "KEEP", "DROP", "RENAME",
+    "FROM", "TS", "WHERE", "LIMIT", "SORT", "STATS", "EVAL", "KEEP", "DROP", "RENAME",
     "ROW", "DISSECT", "GROK", "ENRICH", "MV_EXPAND", "CHANGE_POINT", "LOOKUP", "JOIN",
     "SHOW", "META", "EXPLAIN", "IN", "NOT", "AND", "OR", "BY", "AS", "NULL", "IS",
     "LIKE", "RLIKE", "MATCH", "CASE", "WHEN", "THEN", "ELSE", "END", "TRUE", "FALSE",
+    "SET", "TBUCKET",
 )
 ESQL_KEYWORDS_SET = set(ESQL_KEYWORDS)
 ESQL_KEYWORD_PATTERN = r"(?i)\b(?:%s)\b" % "|".join(re.escape(keyword) for keyword in ESQL_KEYWORDS)
@@ -114,12 +131,38 @@ else:
     ESQLLexer = None
 
 
+if FileHistory is not None:
+    class QueryHistory(FileHistory):
+        """File-backed history that records only executed queries/requests."""
+
+        def __init__(self, filename: str):
+            super().__init__(filename)
+            self._manual_recording = False
+
+        def append_string(self, string: str) -> None:
+            if self._manual_recording:
+                super().append_string(string)
+
+        def store_string(self, string: str) -> None:
+            if self._manual_recording:
+                super().store_string(string)
+
+        def add_manual(self, string: str) -> None:
+            self._manual_recording = True
+            try:
+                super().append_string(string)
+            finally:
+                self._manual_recording = False
+else:
+    QueryHistory = None
+
+
 def create_prompt_session() -> object | None:
     """Create a syntax-highlighting prompt session if dependencies are available."""
     if PromptSession is None:
         return None
     history_file = os.path.expanduser(os.environ.get("ESQL_HISTORY", "~/.esql_history"))
-    kwargs: dict[str, object] = {"history": FileHistory(history_file)} if FileHistory else {}
+    kwargs: dict[str, object] = {"history": QueryHistory(history_file)} if QueryHistory else {}
     if ESQLLexer is not None and PygmentsLexer is not None and Style is not None:
         kwargs["lexer"] = PygmentsLexer(ESQLLexer)
         kwargs["style"] = Style.from_dict(
@@ -137,8 +180,8 @@ def create_prompt_session() -> object | None:
         slash_commands = [
             "\\q", "/q", "\\h", "/h", "/?", "\\clear", "/clear", "\\timing",
             "/timing", "\\format", "/format", "\\f", "/f", "\\autokeywords",
-            "/autokeywords", "\\ak", "/ak", "\\g", "/g", "\\i", "/i", "\\e",
-            "/e", "\\o", "/o", "\\watch", "/watch", "\\set", "/set",
+            "/autokeywords", "\\ak", "/ak", "\\rest", "/rest", "\\g", "/g",
+            "\\i", "/i", "\\e", "/e", "\\o", "/o", "\\watch", "/watch", "\\set", "/set",
             "\\unset", "/unset", "\\conninfo", "/conninfo",
             "\\profile", "/profile", "\\indices", "/indices", "\\df", "/df",
             "\\health", "/health", "\\nodes", "/nodes", "\\shards", "/shards",
@@ -244,6 +287,7 @@ class ESQLClient:
         timing: bool = False,
         auto_keywords: bool = False,
         profile: bool = False,
+        rest_mode: bool = False,
     ):
         self.base = base.rstrip("/")
         self.fmt = fmt
@@ -253,6 +297,7 @@ class ESQLClient:
         self.timing = timing
         self.auto_keywords = auto_keywords
         self.profile = profile
+        self.rest_mode = rest_mode
         self.url = ""
         self.set_format(fmt)
         self.context = None
@@ -261,13 +306,65 @@ class ESQLClient:
             self.context.check_hostname = False
             self.context.verify_mode = ssl.CERT_NONE
         self.last_statement: str = ""
+        self.last_rest_script: str = ""
         self.variables: dict[str, str] = {}
         self.output_path: str | None = None
+        self.prompt_history = None
 
     def set_format(self, fmt: str) -> None:
         self.fmt = fmt
         request_format = "json" if fmt.lower() == "psql" else fmt
         self.url = f"{self.base}/_query?{urllib.parse.urlencode({'format': request_format})}"
+
+    def request_api(
+        self,
+        method: str,
+        path: str,
+        body: str | None = None,
+        content_type: str = "application/json; charset=utf-8",
+    ) -> int:
+        if not path.startswith("/"):
+            path = "/" + path
+        url = f"{self.base}{path}"
+        data = body.encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method.upper())
+
+        for name, value in build_auth_headers(self.no_auth):
+            req.add_header(name, value)
+
+        if data is not None:
+            req.add_header("Content-Type", content_type)
+        if self.fmt.lower() in ("json", "psql"):
+            req.add_header("Accept", "application/json")
+
+        t0 = time.perf_counter()
+        try:
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout, context=self.context) as resp:
+                    raw = resp.read().decode("utf-8")
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="replace")
+                if err_body:
+                    print_error(err_body, e.code, self.fmt)
+                else:
+                    sys.stderr.write(f"ERROR: HTTP {e.code} {e.reason}\n")
+                return e.code
+            except urllib.error.URLError as e:
+                sys.stderr.write(
+                    f"{e}\n\n"
+                    "Hints:\n"
+                    "  - For https with self-signed certs: ES_INSECURE=1 or --insecure\n"
+                    "  - Check ES_URL (include https:// if TLS)\n"
+                    "  - Ensure the cluster is running and credentials are correct\n"
+                )
+                return 1
+
+            print_api_response(raw, self.fmt)
+            return 0
+        finally:
+            if self.timing:
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                sys.stderr.write(f"Time: {elapsed_ms:.3f} ms\n")
 
     def get_api(self, path: str, accept: str = "application/json", pretty_json: bool = False) -> int:
         if not path.startswith("/"):
@@ -424,6 +521,17 @@ def print_response(raw: str, fmt: str) -> None:
             print(raw)
     else:
         print(raw.rstrip())
+
+
+def print_api_response(raw: str, fmt: str) -> None:
+    if fmt.lower() in ("json", "psql"):
+        try:
+            print_json(json.loads(raw))
+        except json.JSONDecodeError:
+            sys.stderr.write("Warning: response was not valid JSON; printing raw body.\n")
+            print(raw.rstrip())
+        return
+    print(raw.rstrip())
 
 
 def format_cell(value: object) -> str:
@@ -596,6 +704,7 @@ def split_complete_statements(text: str) -> tuple[list[str], str]:
       - Triple-quoted strings: \"\"\" ... \"\"\" (no escapes inside, like Python raw)
       - Single/double-quoted strings with backslash escapes
       - Backtick-quoted identifiers: `name with ;`
+      - Leading ES|QL SET clauses: SET name=value; FROM ...
     """
     statements: list[str] = []
     start = 0
@@ -644,6 +753,9 @@ def split_complete_statements(text: str) -> tuple[list[str], str]:
 
         if ch == ";":
             statement = text[start:i].strip()
+            if is_leading_esql_set_clause(statement):
+                i += 1
+                continue
             if statement:
                 statements.append(statement)
             i += 1
@@ -655,9 +767,98 @@ def split_complete_statements(text: str) -> tuple[list[str], str]:
     return statements, text[start:]
 
 
+def is_leading_esql_set_clause(statement: str) -> bool:
+    """Return true when a semicolon closes a leading ES|QL SET clause."""
+    i = 0
+    n = len(statement)
+    while i < n:
+        while i < n and statement[i].isspace():
+            i += 1
+        if statement.startswith("//", i):
+            j = statement.find("\n", i + 2)
+            if j == -1:
+                return False
+            i = j + 1
+            continue
+        if statement.startswith("/*", i):
+            j = statement.find("*/", i + 2)
+            if j == -1:
+                return False
+            i = j + 2
+            continue
+        break
+    starts_with_set = (
+        statement[i:i + 3].upper() == "SET"
+        and (i + 3 == n or not (statement[i + 3].isalnum() or statement[i + 3] == "_"))
+    )
+    if not starts_with_set:
+        return False
+    # Once the actual query body is present, its semicolon terminates the full statement.
+    return re.search(r"(?is)(?:^|[;\s])(FROM|TS|ROW|SHOW|EXPLAIN)\b", statement[i + 3:]) is None
+
+
+REST_REQUEST_RE = re.compile(r"^\s*(GET|POST|PUT|DELETE|PATCH|HEAD)\s+(\S+)\s*$", re.IGNORECASE)
+
+
+@dataclass
+class RestRequest:
+    method: str
+    path: str
+    body: str | None
+
+
+def parse_rest_requests(text: str) -> list[RestRequest]:
+    """Parse Dev Tools-style REST request blocks from text."""
+    requests: list[RestRequest] = []
+    current_method: str | None = None
+    current_path = ""
+    body_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_method, current_path, body_lines
+        if current_method is None:
+            return
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        while body_lines and not body_lines[-1].strip():
+            body_lines.pop()
+        body = "\n".join(body_lines) if body_lines else None
+        if body is not None and current_path.split("?", 1)[0].rstrip("/").endswith("_bulk"):
+            body += "\n"
+        requests.append(RestRequest(current_method, current_path, body))
+        current_method = None
+        current_path = ""
+        body_lines = []
+
+    for line_number, line in enumerate(text.lstrip("\ufeff").splitlines(), start=1):
+        match = REST_REQUEST_RE.match(line)
+        if match:
+            flush()
+            current_method = match.group(1).upper()
+            current_path = match.group(2)
+            continue
+        if current_method is None:
+            if not line.strip() or line.lstrip().startswith(("#", "//")):
+                continue
+            raise ValueError(f"Expected REST request line at line {line_number}: {line}")
+        body_lines.append(line)
+
+    flush()
+    return requests
+
+
+def content_type_for_rest_request(request: RestRequest) -> str:
+    path = request.path.split("?", 1)[0].rstrip("/")
+    if path.endswith("_bulk") or path.endswith("_msearch") or path.endswith("_mget"):
+        return "application/x-ndjson; charset=utf-8"
+    return "application/json; charset=utf-8"
+
+
 def print_repl_help() -> None:
     print(
-        "Tiny ES|QL terminal. End a query with ';' to execute.\n"
+        "Tiny ES|QL terminal. End an ES|QL query with ';' to execute.\n"
+        "In REST request mode, paste request blocks and run them with \\g.\n"
+        "Use \\rest to edit REST request blocks in $EDITOR and run them on save/exit.\n"
         "Use arrow keys for input history.\n"
         "Syntax coloring is enabled when prompt-toolkit + pygments are installed.\n"
         "Autocomplete suggestions (keywords/commands) appear while typing when prompt-toolkit is available.\n"
@@ -670,8 +871,9 @@ def print_repl_help() -> None:
         "  \\timing             Toggle elapsed-time display\n"
         "  \\autokeywords       Toggle automatic keyword uppercasing\n"
         "  \\profile            Toggle ES|QL profile=true request option\n"
-        "  \\g                  Execute the current buffer (or rerun last statement)\n"
-        "  \\i <path>           Include (read & run) a file of ES|QL\n"
+        "  \\rest               Edit REST request blocks in $EDITOR, then run\n"
+        "  \\g                  Execute the current buffer (or rerun last ES|QL/REST input)\n"
+        "  \\i <path>           Include (read & run) a file of ES|QL, or REST blocks in REST mode\n"
         "  \\e                  Edit the current buffer in $EDITOR, then run\n"
         "  \\o [<path>]         Send query output to <path>, or back to stdout if blank\n"
         "  \\watch [<secs>]     Re-run the last statement every N seconds (Ctrl+C to stop)\n"
@@ -715,6 +917,7 @@ def parse_repl_command(line_stripped: str) -> tuple[str | None, str]:
         "timing": "timing", "t": "timing",
         "autokeywords": "autokeywords", "ak": "autokeywords",
         "profile": "profile", "p": "profile",
+        "rest": "rest",
         "g": "go",
         "i": "include", "include": "include",
         "e": "editor", "edit": "editor", "editor": "editor",
@@ -766,6 +969,8 @@ def setup_readline() -> None:
         readline.read_history_file(history_file)
     except FileNotFoundError:
         pass
+    if hasattr(readline, "set_auto_history"):
+        readline.set_auto_history(False)
 
     def save_history() -> None:
         try:
@@ -793,12 +998,28 @@ def _execute_with_output_redirect(client: ESQLClient, statement: str) -> int:
     return _with_output_redirect(client, lambda: client.execute(statement))
 
 
+def _execute_rest_request(client: ESQLClient, request: RestRequest) -> int:
+    path = apply_variables(request.path, client.variables)
+    body = apply_variables(request.body, client.variables) if request.body is not None else None
+    content_type = content_type_for_rest_request(request)
+    add_query_to_history(client, f"{request.method} {path}")
+    return _with_output_redirect(
+        client,
+        lambda: client.request_api(
+            request.method,
+            path,
+            body=body,
+            content_type=content_type,
+        ),
+    )
+
+
 def _run_statements(client: ESQLClient, text: str) -> tuple[int, str]:
     """Tokenize, execute every complete statement, return (last_status, remainder)."""
     statements, remainder = split_complete_statements(text)
     last_status = 0
     for statement in statements:
-        add_query_to_history(statement)
+        add_query_to_history(client, statement)
         try:
             last_status = _execute_with_output_redirect(client, statement)
         except KeyboardInterrupt:
@@ -861,6 +1082,7 @@ def _cmd_conninfo(client: ESQLClient) -> None:
         f"  Timing    {'on' if client.timing else 'off'}\n"
         f"  AutoCaps  {'on' if client.auto_keywords else 'off'}\n"
         f"  Profile   {'on' if client.profile else 'off'}\n"
+        f"  REST mode {'on' if client.rest_mode else 'off'}\n"
         f"  Auth      {auth_method}{(' (' + user + ')') if user != '-' else ''}\n"
         f"  Output    {client.output_path or 'stdout'}\n"
         f"  Variables {len(client.variables)} set\n"
@@ -934,7 +1156,7 @@ def _cmd_shell(args: str) -> None:
         sys.stderr.write(f"Shell error: {exc}\n")
 
 
-def _cmd_editor(buffer: str) -> str:
+def _cmd_editor(buffer: str, suffix: str = ".esql") -> str:
     import subprocess
     import tempfile
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
@@ -945,7 +1167,7 @@ def _cmd_editor(buffer: str) -> str:
         return buffer
     if not editor_args:
         editor_args = ["vi"]
-    with tempfile.NamedTemporaryFile("w+", suffix=".esql", delete=False, encoding="utf-8") as tf:
+    with tempfile.NamedTemporaryFile("w+", suffix=suffix, delete=False, encoding="utf-8") as tf:
         tf.write(buffer)
         path = tf.name
     try:
@@ -969,6 +1191,8 @@ def _cmd_include(client: ESQLClient, args: str) -> tuple[int, str]:
     except OSError as exc:
         sys.stderr.write(f"Cannot read {path}: {exc}\n")
         return 1, ""
+    if client.rest_mode:
+        return run_rest_script(client, contents), ""
     if not contents.endswith(";"):
         contents += ";"
     return _run_statements(client, contents + "\n")
@@ -1034,6 +1258,10 @@ def _dispatch_line(client: ESQLClient, line: str, buffer: str, last_status: int)
         client.profile = not client.profile
         print(f"Profile is {'on' if client.profile else 'off'}.")
         return buffer, last_status, False
+    if cmd_kind == "rest":
+        edited = _cmd_editor(buffer, suffix=".http")
+        status = run_rest_script(client, edited)
+        return ("" if status == 0 else edited), status, False
     if cmd_kind == "conninfo":
         _cmd_conninfo(client)
         return buffer, last_status, False
@@ -1054,11 +1282,20 @@ def _dispatch_line(client: ESQLClient, line: str, buffer: str, last_status: int)
         return buffer + leftover, status, False
     if cmd_kind == "editor":
         edited = _cmd_editor(buffer)
+        if client.rest_mode:
+            return "", run_rest_script(client, edited), False
         status, new_buffer = _run_statements(client, edited)
         return new_buffer, status, False
     if cmd_kind == "watch":
         return buffer, _cmd_watch(client, cmd_args), False
     if cmd_kind == "go":
+        if client.rest_mode:
+            target = buffer.strip() or client.last_rest_script
+            if not target:
+                sys.stderr.write("No REST buffer or previous REST input to execute.\n")
+                return "", last_status, False
+            status = run_rest_script(client, target)
+            return ("" if status == 0 else buffer), status, False
         target = buffer.strip() or client.last_statement
         if not target:
             sys.stderr.write("No buffer or previous statement to execute.\n")
@@ -1098,6 +1335,11 @@ def _dispatch_line(client: ESQLClient, line: str, buffer: str, last_status: int)
         return buffer, _execute_with_output_redirect(client, "SHOW FUNCTIONS"), False
     if cmd_kind == "info":
         return buffer, _execute_with_output_redirect(client, "SHOW INFO"), False
+    if client.rest_mode:
+        if not command and not buffer:
+            return buffer, last_status, False
+        return buffer + line + "\n", last_status, False
+
     if not command:
         return buffer, last_status, False
 
@@ -1114,13 +1356,15 @@ def run_repl(client: ESQLClient) -> int:
             sys.stderr.write(
                 "Note: install prompt-toolkit and pygments for inline syntax highlighting.\n"
             )
+    else:
+        client.prompt_history = getattr(session, "history", None)
     print_repl_help()
     buffer = ""
     last_status = 0
 
     while True:
         try:
-            prompt = "esql> " if not buffer.strip() else "   > "
+            prompt = ("rest> " if client.rest_mode else "esql> ") if not buffer.strip() else "   > "
             if session is None:
                 line = input(prompt)
             else:
@@ -1128,7 +1372,10 @@ def run_repl(client: ESQLClient) -> int:
         except EOFError:
             print()
             if buffer.strip():
-                sys.stderr.write("Discarding unterminated query; add ';' to execute before EOF.\n")
+                if client.rest_mode:
+                    sys.stderr.write("Discarding REST buffer; use \\g to execute before EOF.\n")
+                else:
+                    sys.stderr.write("Discarding unterminated query; add ';' to execute before EOF.\n")
             return last_status
         except KeyboardInterrupt:
             print("^C")
@@ -1150,17 +1397,58 @@ def run_script(client: ESQLClient, text: str) -> int:
         if should_quit:
             return last_status
     if buffer.strip():
-        status, _ = _run_statements(client, buffer + ";")
-        last_status = status
+        if client.rest_mode:
+            last_status = run_rest_script(client, buffer)
+        else:
+            status, _ = _run_statements(client, buffer + ";")
+            last_status = status
     return last_status
 
 
-def add_query_to_history(statement: str) -> None:
+def run_rest_script(client: ESQLClient, text: str) -> int:
+    try:
+        requests = parse_rest_requests(text)
+    except ValueError as exc:
+        sys.stderr.write(f"ERROR: {exc}\n")
+        return 2
+    if not requests:
+        sys.stderr.write("No REST requests provided.\n")
+        return 2
+
+    client.last_rest_script = text.strip()
+    last_status = 0
+    for request in requests:
+        try:
+            last_status = _execute_rest_request(client, request)
+        except KeyboardInterrupt:
+            print("^C", file=sys.stderr)
+            sys.stderr.write("REST request aborted.\n")
+            return 130
+    return last_status
+
+
+def add_query_to_history(client: ESQLClient, statement: str) -> None:
+    entry = " ".join(statement.split())
+    if not entry:
+        return
+    prompt_history = getattr(client, "prompt_history", None)
+    add_manual = getattr(prompt_history, "add_manual", None)
+    if callable(add_manual):
+        add_manual(entry)
+        return
+    append_string = getattr(prompt_history, "append_string", None)
+    if callable(append_string):
+        append_string(entry)
+        return
+    store_string = getattr(prompt_history, "store_string", None)
+    if callable(store_string):
+        store_string(entry)
+        return
     try:
         import readline
     except ImportError:
         return
-    readline.add_history(" ".join(statement.split()))
+    readline.add_history(entry)
 
 
 def main() -> int:
@@ -1185,6 +1473,11 @@ def main() -> int:
         "--no-auth",
         action="store_true",
         help="Skip auth headers entirely (same as ES_NO_AUTH=1)",
+    )
+    parser.add_argument(
+        "--rest",
+        action="store_true",
+        help="Run input as Elasticsearch REST request blocks; with no input, start the REPL in REST mode",
     )
     parser.add_argument(
         "--timeout",
@@ -1250,6 +1543,7 @@ def main() -> int:
         timing=timing,
         auto_keywords=auto_keywords,
         profile=profile,
+        rest_mode=args.rest,
     )
 
     if args.query_file is None and sys.stdin.isatty():
@@ -1257,9 +1551,11 @@ def main() -> int:
 
     query = sys.stdin.read().lstrip("\ufeff") if args.query_file in (None, "-") else read_query_file(args.query_file)
     if not query.strip():
-        sys.stderr.write("No ES|QL query provided. Run ./esql.py for interactive mode, or pass a query file.\n")
+        sys.stderr.write("No input provided. Run ./esql.py for interactive mode, or pass a query file.\n")
         return 2
 
+    if args.rest:
+        return run_rest_script(client, query)
     return run_script(client, query)
 
 

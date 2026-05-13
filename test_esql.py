@@ -86,6 +86,91 @@ def test_splitter() -> None:
         f"s={s}",
     )
 
+    s, rem = esql.split_complete_statements(
+        'SET project_routing="_alias:my-project";\nFROM logs*\n| STATS COUNT(*);'
+    )
+    check(
+        "leading SET clause stays with following query",
+        s == ['SET project_routing="_alias:my-project";\nFROM logs*\n| STATS COUNT(*)'] and rem == "",
+        f"s={s} rem={rem!r}",
+    )
+
+    s, rem = esql.split_complete_statements(
+        'SET a=1;\nFROM first;\nSET b=2;\nFROM second;'
+    )
+    check(
+        "multiple SET-prefixed statements split after query terminators",
+        s == ['SET a=1;\nFROM first', 'SET b=2;\nFROM second'] and rem == "",
+        f"s={s} rem={rem!r}",
+    )
+
+    s, rem = esql.split_complete_statements(
+        '// route hint\nSET project_routing="_alias:my-project";\nFROM logs*;'
+    )
+    check(
+        "comments before leading SET are preserved",
+        s == ['// route hint\nSET project_routing="_alias:my-project";\nFROM logs*'] and rem == "",
+        f"s={s} rem={rem!r}",
+    )
+
+    s, rem = esql.split_complete_statements(
+        'SET time_zone = "+05:00";\n'
+        'TS k8s\n'
+        '| WHERE @timestamp == "2024-05-10T00:04:49.000Z"\n'
+        '| STATS by @timestamp, bucket = TBUCKET(3 hours)\n'
+        '| SORT @timestamp\n'
+        '| LIMIT 2;'
+    )
+    check(
+        "leading SET clause stays with following TS query",
+        s == [
+            'SET time_zone = "+05:00";\n'
+            'TS k8s\n'
+            '| WHERE @timestamp == "2024-05-10T00:04:49.000Z"\n'
+            '| STATS by @timestamp, bucket = TBUCKET(3 hours)\n'
+            '| SORT @timestamp\n'
+            '| LIMIT 2'
+        ] and rem == "",
+        f"s={s} rem={rem!r}",
+    )
+
+
+def test_parse_rest_requests() -> None:
+    section("parse_rest_requests")
+
+    script = """
+PUT sample_data
+{
+  "mappings": {
+    "properties": {
+      "message": {
+        "type": "keyword"
+      }
+    }
+  }
+}
+
+PUT sample_data/_bulk
+{"index": {}}
+{"message": "hello"}
+"""
+    requests = esql.parse_rest_requests(script)
+    check("two REST requests parsed", len(requests) == 2, f"requests={requests}")
+    check("first request is PUT index", requests[0].method == "PUT" and requests[0].path == "sample_data")
+    check("first request body preserved", '"mappings"' in (requests[0].body or ""), f"body={requests[0].body!r}")
+    check("bulk body ends with newline", (requests[1].body or "").endswith("\n"), f"body={requests[1].body!r}")
+    check(
+        "bulk content type is ndjson",
+        esql.content_type_for_rest_request(requests[1]).startswith("application/x-ndjson"),
+    )
+
+    try:
+        esql.parse_rest_requests("FROM logs | LIMIT 1")
+    except ValueError as exc:
+        check("invalid REST script reports bad first line", "Expected REST request line" in str(exc), str(exc))
+    else:
+        check("invalid REST script reports bad first line", False)
+
 
 def test_extract_line_col_errors() -> None:
     section("extract_line_col_errors")
@@ -492,6 +577,158 @@ def test_e2e_multistatement_pipe() -> None:
         httpd.shutdown()
 
 
+def test_e2e_set_clause_stays_with_query() -> None:
+    section("end-to-end: SET clause stays with query")
+    calls: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = self.rfile.read(length).decode("utf-8")
+            calls.append(json.loads(payload).get("query", ""))
+            body = json.dumps({"columns": [{"name": "count"}], "values": [[1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        script = (
+            'SET project_routing="_alias:my-project";\n'
+            'FROM logs*\n'
+            '| STATS COUNT(*);\n'
+            'SET time_zone = "+05:00";\n'
+            'TS k8s\n'
+            '| WHERE @timestamp == "2024-05-10T00:04:49.000Z"\n'
+            '| STATS by @timestamp, bucket = TBUCKET(3 hours)\n'
+            '| SORT @timestamp\n'
+            '| LIMIT 2\n'
+        )
+        proc = run_cli(url, script)
+        check("exit 0", proc.returncode == 0, proc.stderr.decode())
+        check("server saw two queries", len(calls) == 2, f"calls={calls}")
+        check(
+            "SET clause included in FROM query",
+            len(calls) > 0 and calls[0] == 'SET project_routing="_alias:my-project";\nFROM logs*\n| STATS COUNT(*)',
+            f"calls={calls}",
+        )
+        check(
+            "SET clause included in TS query",
+            len(calls) > 1 and calls[1] == (
+                'SET time_zone = "+05:00";\n'
+                'TS k8s\n'
+                '| WHERE @timestamp == "2024-05-10T00:04:49.000Z"\n'
+                '| STATS BY @timestamp, bucket = TBUCKET(3 hours)\n'
+                '| SORT @timestamp\n'
+                '| LIMIT 2'
+            ),
+            f"calls={calls}",
+        )
+    finally:
+        httpd.shutdown()
+
+
+def test_e2e_rest_request_mode() -> None:
+    section("end-to-end: --rest request blocks")
+    seen: list[tuple[str, str, str | None, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_PUT(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            seen.append((self.command, self.path, self.headers.get("Content-Type"), body))
+            if self.path.endswith("/_bulk"):
+                payload = json.dumps({"errors": False, "items": []}).encode()
+            else:
+                payload = json.dumps({"acknowledged": True, "index": self.path.strip("/")}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        script = """
+PUT sample_data
+{
+  "mappings": {
+    "properties": {
+      "message": {
+        "type": "keyword"
+      }
+    }
+  }
+}
+
+PUT sample_data/_bulk
+{"index": {}}
+{"message": "hello"}
+"""
+        proc = run_cli(url, script, "--rest")
+        out = proc.stdout.decode()
+        check("exit 0", proc.returncode == 0, proc.stderr.decode())
+        check("two REST calls sent", len(seen) == 2, f"seen={seen}")
+        check("index path normalized", seen[0][0] == "PUT" and seen[0][1] == "/sample_data", f"seen={seen}")
+        check("json content type used", (seen[0][2] or "").startswith("application/json"), f"seen={seen}")
+        check("bulk path normalized", seen[1][1] == "/sample_data/_bulk", f"seen={seen}")
+        check("bulk content type used", (seen[1][2] or "").startswith("application/x-ndjson"), f"seen={seen}")
+        check("bulk body keeps trailing newline", seen[1][3].endswith("\n"), f"body={seen[1][3]!r}")
+        check("json REST responses printed", '"acknowledged": true' in out and '"errors": false' in out, out)
+    finally:
+        httpd.shutdown()
+
+
+def test_e2e_rest_repl_mode_and_go() -> None:
+    section("end-to-end: --rest REPL mode + \\g")
+    seen: list[tuple[str, str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_PUT(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            seen.append((self.command, self.path, body))
+            payload = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    client = esql.ESQLClient(f"http://{host}:{port}", "psql", 1.0, False, rest_mode=True)
+    try:
+        buffer = ""
+        status = 0
+        out = io.StringIO()
+        with redirect_stdout(out):
+            for line in ("PUT sample_data", "{", '  "settings": {}', "}", "\\g"):
+                buffer, status, should_quit = esql._dispatch_line(client, line, buffer, status)
+                if should_quit:
+                    break
+        check("exit 0", status == 0, f"status={status} out={out.getvalue()}")
+        check("interactive REST request sent", seen == [("PUT", "/sample_data", '{\n  "settings": {}\n}')], f"seen={seen}")
+        check("interactive REST response printed", '"ok": true' in out.getvalue(), out.getvalue())
+    finally:
+        httpd.shutdown()
+
+
 def test_parse_repl_command() -> None:
     section("parse_repl_command")
 
@@ -510,6 +747,7 @@ def test_parse_repl_command() -> None:
     check("/conninfo no args", esql.parse_repl_command("/conninfo") == ("conninfo", ""))
     check("\\autokeywords command", esql.parse_repl_command("\\autokeywords") == ("autokeywords", ""))
     check("\\profile command", esql.parse_repl_command("\\profile") == ("profile", ""))
+    check("\\rest command", esql.parse_repl_command("\\rest") == ("rest", ""))
     check("\\indices command", esql.parse_repl_command("\\indices") == ("indices", ""))
     check("\\di indices alias", esql.parse_repl_command("\\di") == ("indices", ""))
     check("\\health command", esql.parse_repl_command("\\health") == ("health", ""))
@@ -542,6 +780,108 @@ def test_dispatch_format_command() -> None:
     check("status preserved", status == 0, f"status={status}")
     check("does not quit", should_quit is False, f"should_quit={should_quit}")
     check("client format changed", client.fmt == "json" and "format=json" in client.url, f"fmt={client.fmt} url={client.url}")
+
+
+def test_dispatch_rest_opens_editor_and_runs() -> None:
+    section("dispatch: \\rest editor")
+    seen: list[tuple[str, str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_PUT(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            seen.append((self.command, self.path, body))
+            payload = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    client = esql.ESQLClient(f"http://{host}:{port}", "psql", 1.0, False)
+    old_editor = esql._cmd_editor
+    editor_calls: list[tuple[str, str]] = []
+
+    def fake_editor(buffer: str, suffix: str = ".esql") -> str:
+        editor_calls.append((buffer, suffix))
+        return 'PUT sample_data\n{\n  "settings": {}\n}\n'
+
+    esql._cmd_editor = fake_editor
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            new_buffer, status, should_quit = esql._dispatch_line(client, "\\rest", "", 0)
+        check("editor REST exits 0", status == 0, f"status={status} out={buf.getvalue()}")
+        check("editor REST clears buffer", new_buffer == "", f"buffer={new_buffer!r}")
+        check("editor REST does not quit", should_quit is False, f"should_quit={should_quit}")
+        check("editor REST uses HTTP suffix", editor_calls == [("", ".http")], f"editor_calls={editor_calls}")
+        check("editor REST request sent", seen == [("PUT", "/sample_data", '{\n  "settings": {}\n}')], f"seen={seen}")
+        check("editor REST response printed", '"ok": true' in buf.getvalue(), buf.getvalue())
+    finally:
+        esql._cmd_editor = old_editor
+        httpd.shutdown()
+
+
+def test_history_keeps_commands_out() -> None:
+    section("history")
+
+    class FakeHistory:
+        def __init__(self):
+            self.entries: list[str] = []
+
+        def append_string(self, value: str) -> None:
+            self.entries.append(value)
+
+    client = esql.ESQLClient("http://127.0.0.1:9200", "psql", 1.0, False)
+    history = FakeHistory()
+    client.prompt_history = history
+
+    with redirect_stdout(io.StringIO()):
+        esql._dispatch_line(client, "\\h", "", 0)
+        esql._dispatch_line(client, "\\format json", "", 0)
+
+    check("slash commands are not added to history", history.entries == [], f"history={history.entries}")
+
+    original_execute = client.execute
+    client.execute = lambda _statement: 0
+    try:
+        status, remainder = esql._run_statements(client, "FROM logs | LIMIT 1;")
+    finally:
+        client.execute = original_execute
+    check("executed query added to history", history.entries == ["FROM logs | LIMIT 1"], f"history={history.entries}")
+    check("query execution status preserved", status == 0 and remainder == "", f"status={status} remainder={remainder!r}")
+
+
+def test_prompt_history_suppresses_auto_adds() -> None:
+    section("prompt history")
+    if esql.QueryHistory is None:
+        check("prompt-toolkit unavailable", True)
+        return
+
+    import tempfile
+    with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as tf:
+        path = tf.name
+    try:
+        history = esql.QueryHistory(path)
+        history.append_string("\\h")
+        history.store_string("\\q")
+        client = esql.ESQLClient("http://127.0.0.1:9200", "psql", 1.0, False)
+        client.prompt_history = history
+        esql.add_query_to_history(client, "FROM logs | LIMIT 1")
+        with open(path, encoding="utf-8") as handle:
+            contents = handle.read()
+        check("auto-added slash commands ignored", "\\h" not in contents and "\\q" not in contents, contents)
+        check("manual query persisted", "FROM logs | LIMIT 1" in contents, contents)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def test_build_auth_headers() -> None:
@@ -773,6 +1113,7 @@ def test_e2e_no_auth_env() -> None:
 
 def main() -> int:
     test_splitter()
+    test_parse_rest_requests()
     test_extract_line_col_errors()
     test_render_query_pointer()
     test_print_error_caret()
@@ -780,6 +1121,9 @@ def main() -> int:
     test_parse_repl_command()
     test_dispatch_clear_command()
     test_dispatch_format_command()
+    test_dispatch_rest_opens_editor_and_runs()
+    test_history_keeps_commands_out()
+    test_prompt_history_suppresses_auto_adds()
     test_build_auth_headers()
     test_apply_variables()
     test_uppercase_esql_keywords()
@@ -791,6 +1135,9 @@ def main() -> int:
     test_e2e_format_command()
     test_e2e_parse_error_caret()
     test_e2e_multistatement_pipe()
+    test_e2e_set_clause_stays_with_query()
+    test_e2e_rest_request_mode()
+    test_e2e_rest_repl_mode_and_go()
     test_e2e_set_and_substitute()
     test_e2e_show_functions_via_slash_df()
     test_e2e_auto_keywords_env()
