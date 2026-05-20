@@ -288,6 +288,9 @@ class ESQLClient:
         auto_keywords: bool = False,
         profile: bool = False,
         rest_mode: bool = False,
+        user: str | None = None,
+        password: str | None = None,
+        api_key: str | None = None,
     ):
         self.base = base.rstrip("/")
         self.fmt = fmt
@@ -298,6 +301,10 @@ class ESQLClient:
         self.auto_keywords = auto_keywords
         self.profile = profile
         self.rest_mode = rest_mode
+        self.auth_user = user
+        self.auth_password = password
+        self.auth_api_key = api_key
+        self.prefer_basic_auth = user is not None or password is not None
         self.url = ""
         self.set_format(fmt)
         self.context = None
@@ -316,6 +323,42 @@ class ESQLClient:
         request_format = "json" if fmt.lower() == "psql" else fmt
         self.url = f"{self.base}/_query?{urllib.parse.urlencode({'format': request_format})}"
 
+    def auth_headers(self) -> list[tuple[str, str]]:
+        return build_auth_headers(
+            self.no_auth,
+            api_key=self.auth_api_key,
+            user=self.auth_user,
+            password=self.auth_password,
+            prefer_basic=self.prefer_basic_auth,
+        )
+
+    def check_connection(self) -> int:
+        """Verify the configured endpoint and credentials before starting the REPL."""
+        req = urllib.request.Request(f"{self.base}/", method="GET")
+        for name, value in self.auth_headers():
+            req.add_header(name, value)
+        req.add_header("Accept", "application/json")
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self.context) as resp:
+                resp.read()
+        except urllib.error.HTTPError as e:
+            sys.stderr.write(f"Connection check failed for {self.base}\n")
+            err_body = e.read().decode("utf-8", errors="replace")
+            if err_body:
+                print_error(err_body, e.code, self.fmt)
+            else:
+                sys.stderr.write(f"ERROR: HTTP {e.code} {e.reason}\n")
+            return e.code
+        except urllib.error.URLError as e:
+            sys.stderr.write(f"Connection check failed for {self.base}\n")
+            return print_connection_error(e)
+        except OSError as e:
+            sys.stderr.write(f"Connection check failed for {self.base}\n")
+            return print_connection_error(e)
+
+        return 0
+
     def request_api(
         self,
         method: str,
@@ -329,7 +372,7 @@ class ESQLClient:
         data = body.encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=data, method=method.upper())
 
-        for name, value in build_auth_headers(self.no_auth):
+        for name, value in self.auth_headers():
             req.add_header(name, value)
 
         if data is not None:
@@ -350,14 +393,9 @@ class ESQLClient:
                     sys.stderr.write(f"ERROR: HTTP {e.code} {e.reason}\n")
                 return e.code
             except urllib.error.URLError as e:
-                sys.stderr.write(
-                    f"{e}\n\n"
-                    "Hints:\n"
-                    "  - For https with self-signed certs: ES_INSECURE=1 or --insecure\n"
-                    "  - Check ES_URL (include https:// if TLS)\n"
-                    "  - Ensure the cluster is running and credentials are correct\n"
-                )
-                return 1
+                return print_connection_error(e)
+            except OSError as e:
+                return print_connection_error(e)
 
             print_api_response(raw, self.fmt)
             return 0
@@ -372,7 +410,7 @@ class ESQLClient:
         url = f"{self.base}{path}"
         req = urllib.request.Request(url, method="GET")
 
-        for name, value in build_auth_headers(self.no_auth):
+        for name, value in self.auth_headers():
             req.add_header(name, value)
 
         req.add_header("Accept", accept)
@@ -388,14 +426,9 @@ class ESQLClient:
                 sys.stderr.write(f"ERROR: HTTP {e.code} {e.reason}\n")
             return e.code
         except urllib.error.URLError as e:
-            sys.stderr.write(
-                f"{e}\n\n"
-                "Hints:\n"
-                "  - For https with self-signed certs: ES_INSECURE=1 or --insecure\n"
-                "  - Check ES_URL (include https:// if TLS)\n"
-                "  - Ensure the cluster is running and credentials are correct\n"
-            )
-            return 1
+            return print_connection_error(e)
+        except OSError as e:
+            return print_connection_error(e)
 
         if pretty_json:
             try:
@@ -422,7 +455,7 @@ class ESQLClient:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(self.url, data=body, method="POST")
 
-        for name, value in build_auth_headers(self.no_auth):
+        for name, value in self.auth_headers():
             req.add_header(name, value)
 
         req.add_header("Content-Type", "application/json; charset=utf-8")
@@ -442,14 +475,9 @@ class ESQLClient:
                     sys.stderr.write(f"ERROR: HTTP {e.code} {e.reason}\n")
                 return e.code
             except urllib.error.URLError as e:
-                sys.stderr.write(
-                    f"{e}\n\n"
-                    "Hints:\n"
-                    "  - For https with self-signed certs: ES_INSECURE=1 or --insecure\n"
-                    "  - Check ES_URL (include https:// if TLS)\n"
-                    "  - Ensure the cluster is running and credentials are correct\n"
-                )
-                return 1
+                return print_connection_error(e)
+            except OSError as e:
+                return print_connection_error(e)
 
             print_response(raw, self.fmt)
             return 0
@@ -464,22 +492,40 @@ def read_query_file(path: str) -> str:
         return handle.read().lstrip("\ufeff").strip()
 
 
-def build_auth_headers(no_auth: bool = False) -> list[tuple[str, str]]:
+def build_auth_headers(
+    no_auth: bool = False,
+    api_key: str | None = None,
+    user: str | None = None,
+    password: str | None = None,
+    prefer_basic: bool = False,
+) -> list[tuple[str, str]]:
     if no_auth or env_flag("ES_NO_AUTH"):
         return []
-    api_key = os.environ.get("ES_API_KEY")
-    if api_key:
+    api_key_value = api_key if api_key is not None else os.environ.get("ES_API_KEY")
+    if api_key_value and not prefer_basic:
         # Accept either the raw "id:secret" form or an already-base64-encoded key.
-        if ":" in api_key and api_key.strip().isascii():
-            token = b64encode(api_key.encode("ascii")).decode("ascii")
+        if ":" in api_key_value and api_key_value.strip().isascii():
+            token = b64encode(api_key_value.encode("ascii")).decode("ascii")
         else:
-            token = api_key.strip()
+            token = api_key_value.strip()
         return [("Authorization", f"ApiKey {token}")]
 
-    user = os.environ.get("ES_USER", "elastic")
-    password = os.environ.get("ES_PASSWORD", "password")
-    basic = b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+    user_value = user if user is not None else os.environ.get("ES_USER", "elastic")
+    password_value = password if password is not None else os.environ.get("ES_PASSWORD", "password")
+    basic = b64encode(f"{user_value}:{password_value}".encode("utf-8")).decode("ascii")
     return [("Authorization", f"Basic {basic}")]
+
+
+def print_connection_error(exc: BaseException) -> int:
+    sys.stderr.write(
+        f"{exc}\n\n"
+        "Hints:\n"
+        "  - For port-forwarded clusters: verify the port-forward is still running\n"
+        "  - For https with self-signed certs: ES_INSECURE=1 or --insecure\n"
+        "  - Check ES_URL (include https:// if TLS)\n"
+        "  - Ensure the cluster is running and credentials are correct\n"
+    )
+    return 1
 
 
 def should_color_json() -> bool:
@@ -1070,8 +1116,9 @@ def _cmd_conninfo(client: ESQLClient) -> None:
         auth_method = "None"
         user = "-"
     else:
-        auth_method = "ApiKey" if os.environ.get("ES_API_KEY") else "Basic"
-        user = os.environ.get("ES_USER", "elastic") if auth_method == "Basic" else "-"
+        uses_api_key = bool(client.auth_api_key or os.environ.get("ES_API_KEY")) and not client.prefer_basic_auth
+        auth_method = "ApiKey" if uses_api_key else "Basic"
+        user = (client.auth_user or os.environ.get("ES_USER", "elastic")) if auth_method == "Basic" else "-"
     print(
         "Connection:\n"
         f"  URL       {client.base}\n"
@@ -1465,6 +1512,21 @@ def main() -> int:
         help="Output format: psql, json, txt, csv, yaml, ... (default psql or ES_FORMAT)",
     )
     parser.add_argument(
+        "--url",
+        default=None,
+        help="Elasticsearch base URL (default ES_URL or http://127.0.0.1:9200)",
+    )
+    parser.add_argument(
+        "--user",
+        default=None,
+        help="Basic auth username (default ES_USER or elastic)",
+    )
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="Basic auth password (default ES_PASSWORD or password)",
+    )
+    parser.add_argument(
         "--insecure",
         action="store_true",
         help="Skip TLS certificate verification (same as ES_INSECURE=1)",
@@ -1535,7 +1597,7 @@ def main() -> int:
     else:
         auto_keywords = args.auto_keywords
     client = ESQLClient(
-        base=os.environ.get("ES_URL", "http://127.0.0.1:9200"),
+        base=args.url or os.environ.get("ES_URL", "http://127.0.0.1:9200"),
         fmt=args.format,
         timeout=args.timeout,
         insecure=insecure,
@@ -1544,9 +1606,14 @@ def main() -> int:
         auto_keywords=auto_keywords,
         profile=profile,
         rest_mode=args.rest,
+        user=args.user,
+        password=args.password,
     )
 
     if args.query_file is None and sys.stdin.isatty():
+        status = client.check_connection()
+        if status != 0:
+            return status
         return run_repl(client)
 
     query = sys.stdin.read().lstrip("\ufeff") if args.query_file in (None, "-") else read_query_file(args.query_file)

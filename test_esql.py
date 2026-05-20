@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -414,6 +415,83 @@ def test_e2e_indices_command() -> None:
         err = proc.stderr.decode()
         check("exit 0", proc.returncode == 0, f"rc={proc.returncode} err={err}")
         check("_cat indices output printed", "my_index" in out and "docs.count" in out, out)
+    finally:
+        httpd.shutdown()
+
+
+def test_e2e_indices_connection_reset() -> None:
+    section("end-to-end: \\indices connection reset")
+
+    class ResetHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_GET(self):
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.connection.close()
+
+    httpd = HTTPServer(("127.0.0.1", 0), ResetHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        proc = run_cli(url, "\\indices\n")
+        err = proc.stderr.decode()
+        check("connection reset exits nonzero without traceback", proc.returncode != 0, f"rc={proc.returncode}")
+        check("connection reset rendered", "Connection reset" in err or "Remote end closed" in err, err)
+        check("traceback suppressed", "Traceback" not in err, err)
+        check("port-forward hint shown", "port-forward" in err, err)
+    finally:
+        httpd.shutdown()
+
+
+def test_connection_check() -> None:
+    section("connection check")
+
+    seen_auth: list[str | None] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_GET(self):
+            seen_auth.append(self.headers.get("Authorization"))
+            if self.path == "/unauthorized/":
+                payload = json.dumps(
+                    {
+                        "error": {
+                            "type": "security_exception",
+                            "reason": "unable to authenticate user [elastic]",
+                        },
+                        "status": 401,
+                    }
+                ).encode()
+                self.send_response(401)
+            else:
+                payload = json.dumps({"tagline": "You Know, for Search"}).encode()
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        ok_client = esql.ESQLClient(url, "psql", 1.0, False, user="u", password="p")
+        check("connection check succeeds", ok_client.check_connection() == 0)
+        check("connection check sends configured auth", seen_auth == ["Basic dTpw"], f"seen_auth={seen_auth}")
+
+        err_client = esql.ESQLClient(f"{url}/unauthorized", "psql", 1.0, False)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            status = err_client.check_connection()
+        output = err.getvalue()
+        check("connection check returns HTTP status", status == 401, f"status={status} output={output}")
+        check("connection check prints auth error", "security_exception" in output, output)
     finally:
         httpd.shutdown()
 
@@ -903,6 +981,12 @@ def test_build_auth_headers() -> None:
             headers == [("Authorization", "ApiKey aWQ6c2VjcmV0")],
             f"headers={headers}",
         )
+        headers = esql.build_auth_headers(user="cli_user", password="cli_password", prefer_basic=True)
+        check(
+            "explicit basic auth overrides api key",
+            headers == [("Authorization", "Basic Y2xpX3VzZXI6Y2xpX3Bhc3N3b3Jk")],
+            f"headers={headers}",
+        )
     finally:
         for name, value in saved.items():
             if value is None:
@@ -1111,6 +1195,60 @@ def test_e2e_no_auth_env() -> None:
         httpd.shutdown()
 
 
+def test_e2e_cli_connection_options() -> None:
+    section("end-to-end: CLI connection options")
+    seen: list[str | None] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_POST(self):
+            seen.append(self.headers.get("Authorization"))
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            payload = json.dumps({"columns": [{"name": "n"}], "values": [[1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        env = dict(os.environ)
+        env["ES_URL"] = "http://127.0.0.1:1"
+        env["ES_USER"] = "env_user"
+        env["ES_PASSWORD"] = "env_password"
+        env["ES_API_KEY"] = "env_id:env_secret"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(HERE, "esql.py"),
+                "--url",
+                url,
+                "--user",
+                "cli_user",
+                "--password",
+                "cli_password",
+            ],
+            input=b"FROM logs | LIMIT 1;\n",
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        check("exit 0", proc.returncode == 0, proc.stderr.decode())
+        check(
+            "CLI credentials override environment",
+            seen == ["Basic Y2xpX3VzZXI6Y2xpX3Bhc3N3b3Jk"],
+            f"seen={seen}",
+        )
+    finally:
+        httpd.shutdown()
+
+
 def main() -> int:
     test_splitter()
     test_parse_rest_requests()
@@ -1131,6 +1269,8 @@ def main() -> int:
     test_e2e_timing_env()
     test_e2e_profile_cli()
     test_e2e_indices_command()
+    test_e2e_indices_connection_reset()
+    test_connection_check()
     test_e2e_common_api_commands()
     test_e2e_format_command()
     test_e2e_parse_error_caret()
@@ -1142,6 +1282,7 @@ def main() -> int:
     test_e2e_show_functions_via_slash_df()
     test_e2e_auto_keywords_env()
     test_e2e_no_auth_env()
+    test_e2e_cli_connection_options()
     print(f"\n{PASSED} passed, {FAILED} failed")
     return 0 if FAILED == 0 else 1
 

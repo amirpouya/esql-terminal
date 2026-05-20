@@ -27,6 +27,7 @@ python3 ./esql.py --help
 ./esql.py                 # interactive REPL
 ./esql.py query.esql      # run a file
 ./esql.py < query.esql    # run from stdin
+./esql.py --url http://localhost:9200 --user elastic --password secret
 ./esql.py --timing        # print elapsed query time
 ./esql.py --profile       # send {"profile": true} with each ES|QL request
 ./esql.py --no-auth       # talk to an unsecured local cluster without auth headers
@@ -125,6 +126,10 @@ python3 -m pip install prompt-toolkit pygments
 | `ESQL_COLOR` | `auto` | `1`/`always` to force JSON color, `0`/`never` to disable |
 | `ES_AUTO_KEYWORDS` | `1` | Auto-uppercase ES|QL keywords before execution (`0` disables) |
 | `ESQL_HISTORY` | `~/.esql_history` | Path to history file |
+
+Connection options can also be passed as CLI flags: `--url`, `--user`, and
+`--password`. CLI values override the corresponding environment variables for the
+current run.
 
 ## REPL commands
 
