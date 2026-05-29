@@ -741,6 +741,96 @@ def print_psql_table(response: dict[str, object]) -> None:
     print(f"({len(rows)} {'row' if len(rows) == 1 else 'rows'})")
 
 
+def _has_unescaped_double_quote(text: str) -> bool:
+    """Return True if `text` contains a `"` that is not preceded by an escaping `\\`."""
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if text[i] == '"':
+            return True
+        i += 1
+    return False
+
+
+def _ends_with_escaped_quote(text: str) -> bool:
+    """Return True if the trailing `"` of `text` is escaped (preceded by an odd run of `\\`)."""
+    if not text.endswith('"'):
+        return False
+    backslashes = 0
+    i = len(text) - 2
+    while i >= 0 and text[i] == "\\":
+        backslashes += 1
+        i -= 1
+    return backslashes % 2 == 1
+
+
+def _shell_unescape(text: str) -> str:
+    """Replace `\\\"` with `\"` and `\\\\` with `\\` (single left-to-right pass)."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == '"':
+                out.append('"')
+                i += 2
+                continue
+            if nxt == "\\":
+                out.append("\\")
+                i += 2
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def unwrap_escaped_query(text: str) -> str:
+    """Detect and undo JSON/shell-style quote-escaping that wraps a pasted query.
+
+    Two paste forms are recognized when the buffer ends with `;`:
+
+      "FROM x | WHERE c LIKE \\"*\\""    (outer quotes plus escaped \\")
+       FROM x | WHERE c LIKE \\"*\\"     (no outer quotes, just escaped \\")
+
+    Detection is conservative: the input must contain `\\"` and have no
+    unescaped `"` that would imply a normal ES|QL string literal. Anything
+    else (regular ES|QL, or input that does not yet end with `;`) is returned
+    unchanged so existing behavior is preserved.
+    """
+    rstripped = text.rstrip()
+    if not rstripped.endswith(";"):
+        return text
+    body = rstripped[:-1].strip()
+    if not body:
+        return text
+
+    decoded: str | None = None
+
+    is_wrapped = (
+        len(body) >= 2
+        and body[0] == '"'
+        and body[-1] == '"'
+        and not _ends_with_escaped_quote(body)
+    )
+    if is_wrapped:
+        inner = body[1:-1]
+        if "\\\"" in inner and not _has_unescaped_double_quote(inner):
+            decoded = _shell_unescape(inner)
+
+    if decoded is None and "\\\"" in body and not _has_unescaped_double_quote(body):
+        decoded = _shell_unescape(body)
+
+    if decoded is None:
+        return text
+
+    leading = text[: len(text) - len(text.lstrip())]
+    return leading + decoded + ";\n"
+
+
 def split_complete_statements(text: str) -> tuple[list[str], str]:
     """Split on ';' while ignoring terminators inside ES|QL strings/comments/identifiers.
 
@@ -1062,6 +1152,7 @@ def _execute_rest_request(client: ESQLClient, request: RestRequest) -> int:
 
 def _run_statements(client: ESQLClient, text: str) -> tuple[int, str]:
     """Tokenize, execute every complete statement, return (last_status, remainder)."""
+    text = unwrap_escaped_query(text)
     statements, remainder = split_complete_statements(text)
     last_status = 0
     for statement in statements:

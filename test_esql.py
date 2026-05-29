@@ -136,6 +136,84 @@ def test_splitter() -> None:
     )
 
 
+def test_unwrap_escaped_query() -> None:
+    section("unwrap_escaped_query")
+
+    user_example = (
+        'FROM test | EVAL c = CONCAT(x::keyword, \\": \\", message)'
+        ' | WHERE x > 1 AND c LIKE \\"*G*\\"'
+    )
+    expected = (
+        'FROM test | EVAL c = CONCAT(x::keyword, ": ", message)'
+        ' | WHERE x > 1 AND c LIKE "*G*"'
+    )
+
+    out = esql.unwrap_escaped_query(f'"{user_example}";\n')
+    check(
+        "wrapped form: outer quotes plus escaped quotes inside",
+        out == f"{expected};\n",
+        f"out={out!r}",
+    )
+
+    out = esql.unwrap_escaped_query(f"{user_example};\n")
+    check(
+        "unwrapped form: just escaped quotes inside",
+        out == f"{expected};\n",
+        f"out={out!r}",
+    )
+
+    leading = "  \t"
+    out = esql.unwrap_escaped_query(f'{leading}"{user_example}";\n')
+    check(
+        "wrapped form preserves leading whitespace",
+        out == f"{leading}{expected};\n",
+        f"out={out!r}",
+    )
+
+    plain = 'FROM logs | WHERE level == "info";\n'
+    check(
+        "regular ES|QL is left untouched",
+        esql.unwrap_escaped_query(plain) == plain,
+        f"out={esql.unwrap_escaped_query(plain)!r}",
+    )
+
+    plain_no_semi = '"FROM logs | WHERE c LIKE \\"*\\""\n'
+    check(
+        "buffer without trailing ';' is left alone (still being typed)",
+        esql.unwrap_escaped_query(plain_no_semi) == plain_no_semi,
+        f"out={esql.unwrap_escaped_query(plain_no_semi)!r}",
+    )
+
+    multistatement = "FROM a; FROM b;\n"
+    check(
+        "multiple plain statements untouched",
+        esql.unwrap_escaped_query(multistatement) == multistatement,
+        f"out={esql.unwrap_escaped_query(multistatement)!r}",
+    )
+
+    legitimate_inner_escape = 'ROW x = "He said \\"hi\\"";\n'
+    check(
+        "legitimate ES|QL with embedded escaped quotes is left alone",
+        esql.unwrap_escaped_query(legitimate_inner_escape) == legitimate_inner_escape,
+        f"out={esql.unwrap_escaped_query(legitimate_inner_escape)!r}",
+    )
+
+    multiline = '"FROM test\n| WHERE c LIKE \\"*G*\\"";\n'
+    expected_multiline = 'FROM test\n| WHERE c LIKE "*G*";\n'
+    check(
+        "wrapped multi-line buffer with escaped quotes",
+        esql.unwrap_escaped_query(multiline) == expected_multiline,
+        f"out={esql.unwrap_escaped_query(multiline)!r}",
+    )
+
+    statements, _ = esql.split_complete_statements(esql.unwrap_escaped_query(f"{user_example};"))
+    check(
+        "_run_statements pipeline yields the unescaped query",
+        statements == [expected],
+        f"statements={statements}",
+    )
+
+
 def test_parse_rest_requests() -> None:
     section("parse_rest_requests")
 
@@ -651,6 +729,61 @@ def test_e2e_multistatement_pipe() -> None:
         check("server saw 2 statements", len(calls) == 2, f"calls={calls}")
         check("first statement preserved", "FROM a" in calls[0] and ";" not in calls[0].split("/*")[0], f"call0={calls[0]!r}")
         check("second statement triple-quoted intact", '"""' in calls[1] and "FROM b" in calls[1], f"call1={calls[1]!r}")
+    finally:
+        httpd.shutdown()
+
+
+def test_e2e_unwrap_escaped_query_pipe() -> None:
+    section("end-to-end: shell/JSON-escaped query pasted via pipe")
+    seen: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = self.rfile.read(length).decode("utf-8")
+            seen.append(json.loads(payload).get("query", ""))
+            body = json.dumps({"columns": [{"name": "n"}], "values": [[1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        expected = (
+            'FROM test | EVAL c = CONCAT(x::keyword, ": ", message)'
+            ' | WHERE x > 1 AND c LIKE "*G*"'
+        )
+        wrapped = (
+            '"FROM test | EVAL c = CONCAT(x::keyword, \\": \\", message)'
+            ' | WHERE x > 1 AND c LIKE \\"*G*\\"";\n'
+        )
+        proc = run_cli(url, wrapped)
+        check("wrapped form exit 0", proc.returncode == 0, proc.stderr.decode())
+        check(
+            "wrapped form sent unescaped query to server",
+            seen and seen[-1] == expected,
+            f"seen={seen}",
+        )
+
+        seen.clear()
+        unwrapped = (
+            'FROM test | EVAL c = CONCAT(x::keyword, \\": \\", message)'
+            ' | WHERE x > 1 AND c LIKE \\"*G*\\";\n'
+        )
+        proc = run_cli(url, unwrapped)
+        check("unwrapped form exit 0", proc.returncode == 0, proc.stderr.decode())
+        check(
+            "unwrapped form sent unescaped query to server",
+            seen and seen[-1] == expected,
+            f"seen={seen}",
+        )
     finally:
         httpd.shutdown()
 
@@ -1251,6 +1384,7 @@ def test_e2e_cli_connection_options() -> None:
 
 def main() -> int:
     test_splitter()
+    test_unwrap_escaped_query()
     test_parse_rest_requests()
     test_extract_line_col_errors()
     test_render_query_pointer()
@@ -1275,6 +1409,7 @@ def main() -> int:
     test_e2e_format_command()
     test_e2e_parse_error_caret()
     test_e2e_multistatement_pipe()
+    test_e2e_unwrap_escaped_query_pipe()
     test_e2e_set_clause_stays_with_query()
     test_e2e_rest_request_mode()
     test_e2e_rest_repl_mode_and_go()
