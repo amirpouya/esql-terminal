@@ -75,6 +75,31 @@ PUT sample_data/_bulk
 {"@timestamp": "2023-10-23T12:15:03.360Z", "client_ip": "172.21.2.162", "message": "Connected to 10.1.0.3", "event_duration": 3450233}
 ```
 
+### Pasting `curl` commands
+
+REST mode also recognizes `curl ...` invocations, so you can paste a command
+straight from a docs page or shell history without rewriting it as a method/path
+block. Multi-line bodies (single-quoted with embedded newlines) and trailing
+backslash continuations are both supported.
+
+The host portion of the URL and any auth-related flags (`-u`, `-H`, etc.) are
+stripped — the request is forwarded to the cluster `esql.py` is configured to
+talk to using its own credentials. Method is taken from `-X`, or inferred as
+`POST` when `-d` is present, otherwise `GET`.
+
+```bash
+curl -u elastic:password -H "Content-Type: application/json" \
+  "127.0.0.1:9200/_query?format=txt" -d '
+{
+  "query":
+    "FROM test | EVAL c = CONCAT(x::keyword, \": \", message) | WHERE x > 1 AND c LIKE \"*G*\""
+}
+'
+```
+
+The example above is sent to the configured cluster as `POST /_query?format=txt`
+with the JSON body intact.
+
 ## Load Wikipedia Sample Data
 
 Load random Wikipedia page summaries into a local Elasticsearch index:

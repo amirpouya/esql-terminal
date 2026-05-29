@@ -934,6 +934,7 @@ def is_leading_esql_set_clause(statement: str) -> bool:
 
 
 REST_REQUEST_RE = re.compile(r"^\s*(GET|POST|PUT|DELETE|PATCH|HEAD)\s+(\S+)\s*$", re.IGNORECASE)
+CURL_LINE_RE = re.compile(r"^\s*curl(?:\s|$)", re.IGNORECASE)
 
 
 @dataclass
@@ -943,8 +944,139 @@ class RestRequest:
     body: str | None
 
 
+# curl flags that consume the next token as a value. Anything not listed here is
+# treated as a no-arg flag; unknown flags are simply ignored.
+_CURL_VALUE_FLAGS = frozenset({
+    "-u", "--user",
+    "-H", "--header",
+    "-X", "--request",
+    "-d", "--data", "--data-raw", "--data-binary", "--data-ascii", "--data-urlencode",
+    "-A", "--user-agent",
+    "-e", "--referer",
+    "-b", "--cookie", "-c", "--cookie-jar",
+    "-o", "--output",
+    "-T", "--upload-file",
+    "-F", "--form", "--form-string",
+    "-K", "--config",
+    "--cacert", "--capath", "--cert", "--key", "--cert-type", "--key-type", "--pass",
+    "--ciphers", "--tls-max",
+    "--connect-timeout", "-m", "--max-time", "--retry", "--retry-delay", "--retry-max-time",
+    "--max-redirs", "--proxy", "-x", "--proxy-user", "-U",
+    "--resolve", "--interface",
+    "-w", "--write-out",
+    "-r", "--range", "-z", "--time-cond",
+    "--limit-rate",
+})
+
+_CURL_BODY_FLAGS = frozenset({
+    "-d", "--data", "--data-raw", "--data-binary", "--data-ascii", "--data-urlencode",
+})
+
+
+def _accumulate_curl_command(lines: list[str], start: int) -> tuple[str, int]:
+    """Gather lines starting at `lines[start]` until they form a complete shell command.
+
+    Handles two shell multi-line conventions:
+      - Trailing-backslash continuation (`...\\` at end of a line joins to the next).
+      - Open quotation marks that span lines (shlex.split raises ValueError until closed).
+
+    Returns the joined command text and the index of the next unconsumed line.
+    """
+    parts: list[str] = []
+    i = start
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if parts and parts[-1].endswith("\\"):
+            parts[-1] = parts[-1][:-1]
+            parts.append(" ")
+            parts.append(line)
+        else:
+            if parts:
+                parts.append("\n")
+            parts.append(line)
+        i += 1
+        candidate = "".join(parts)
+        try:
+            shlex.split(candidate, posix=True)
+        except ValueError:
+            continue
+        return candidate, i
+    return "".join(parts), i
+
+
+def parse_curl_command(command: str) -> RestRequest:
+    """Convert a single shell `curl ...` invocation into a RestRequest.
+
+    The cluster URL/host is stripped — only the path and query string are kept,
+    so the request is forwarded to the configured ES base URL with the configured
+    auth/content-type. Auth flags (`-u`, `-H "Authorization: ..."`) and unrelated
+    options are ignored on purpose.
+    """
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"Could not parse curl command: {exc}") from exc
+    if not tokens or tokens[0].lower() != "curl":
+        raise ValueError("Not a curl command")
+
+    method: str | None = None
+    url: str | None = None
+    body_parts: list[str] = []
+
+    i = 1
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok in ("-X", "--request"):
+            i += 1
+            if i < n:
+                method = tokens[i].upper()
+        elif tok in _CURL_BODY_FLAGS:
+            i += 1
+            if i < n:
+                body_parts.append(tokens[i])
+        elif tok in ("-G", "--get"):
+            method = method or "GET"
+        elif tok in ("-I", "--head"):
+            method = method or "HEAD"
+        elif tok in _CURL_VALUE_FLAGS:
+            i += 1  # consume and discard the flag's value
+        elif tok.startswith("-") and len(tok) > 1:
+            pass  # unknown flag with no value we care about
+        elif url is None:
+            url = tok
+        i += 1
+
+    if url is None:
+        raise ValueError("missing URL")
+
+    if method is None:
+        method = "POST" if body_parts else "GET"
+
+    body = "".join(body_parts) if body_parts else None
+
+    if "://" in url:
+        parsed = urllib.parse.urlsplit(url)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+    elif url.startswith("/"):
+        path = url
+    else:
+        parsed = urllib.parse.urlsplit(f"http://{url}")
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+    if body is not None and path.split("?", 1)[0].rstrip("/").endswith("_bulk") and not body.endswith("\n"):
+        body += "\n"
+
+    return RestRequest(method, path, body)
+
+
 def parse_rest_requests(text: str) -> list[RestRequest]:
-    """Parse Dev Tools-style REST request blocks from text."""
+    """Parse Dev Tools-style REST request blocks (and `curl ...` commands) from text."""
     requests: list[RestRequest] = []
     current_method: str | None = None
     current_path = ""
@@ -966,18 +1098,38 @@ def parse_rest_requests(text: str) -> list[RestRequest]:
         current_path = ""
         body_lines = []
 
-    for line_number, line in enumerate(text.lstrip("\ufeff").splitlines(), start=1):
+    raw_lines = text.lstrip("\ufeff").splitlines()
+    i = 0
+    n = len(raw_lines)
+    while i < n:
+        line = raw_lines[i]
+        line_number = i + 1
+
+        if CURL_LINE_RE.match(line):
+            flush()
+            command, end = _accumulate_curl_command(raw_lines, i)
+            try:
+                requests.append(parse_curl_command(command))
+            except ValueError as exc:
+                raise ValueError(f"Invalid curl command at line {line_number}: {exc}") from exc
+            i = end
+            continue
+
         match = REST_REQUEST_RE.match(line)
         if match:
             flush()
             current_method = match.group(1).upper()
             current_path = match.group(2)
+            i += 1
             continue
+
         if current_method is None:
             if not line.strip() or line.lstrip().startswith(("#", "//")):
+                i += 1
                 continue
             raise ValueError(f"Expected REST request line at line {line_number}: {line}")
         body_lines.append(line)
+        i += 1
 
     flush()
     return requests

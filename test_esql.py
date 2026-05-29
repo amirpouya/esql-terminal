@@ -251,6 +251,169 @@ PUT sample_data/_bulk
         check("invalid REST script reports bad first line", False)
 
 
+def test_parse_curl_command() -> None:
+    section("parse_curl_command")
+
+    req = esql.parse_curl_command("curl http://localhost:9200/_search")
+    check(
+        "bare GET picks up host and path",
+        req.method == "GET" and req.path == "/_search" and req.body is None,
+        f"req={req}",
+    )
+
+    req = esql.parse_curl_command(
+        'curl -u elastic:password -H "Content-Type: application/json" '
+        '"127.0.0.1:9200/_query?format=txt" -d \'{"query":"FROM x"}\''
+    )
+    check(
+        "POST inferred from -d, host stripped, query string preserved",
+        req.method == "POST"
+        and req.path == "/_query?format=txt"
+        and req.body == '{"query":"FROM x"}',
+        f"req={req}",
+    )
+
+    req = esql.parse_curl_command(
+        "curl -X PUT 'http://es:9200/sample' -d '{\"settings\":{}}'"
+    )
+    check(
+        "explicit -X overrides body-implied method",
+        req.method == "PUT" and req.path == "/sample" and req.body == '{"settings":{}}',
+        f"req={req}",
+    )
+
+    req = esql.parse_curl_command("curl -X DELETE http://es:9200/sample")
+    check(
+        "DELETE without body is preserved",
+        req.method == "DELETE" and req.path == "/sample" and req.body is None,
+        f"req={req}",
+    )
+
+    multiline_curl = (
+        'curl -u elastic:password '
+        '-H "Content-Type: application/json" '
+        '"127.0.0.1:9200/_query?format=txt" -d \'\n'
+        '{\n'
+        '  "query":\n'
+        '    "FROM test | EVAL c = CONCAT(x::keyword, \\": \\", message)'
+        ' | WHERE x > 1 AND c LIKE \\"*G*\\""\n'
+        '}\n'
+        "'"
+    )
+    req = esql.parse_curl_command(multiline_curl)
+    body = req.body or ""
+    check(
+        "multi-line single-quoted body is preserved verbatim",
+        req.method == "POST"
+        and req.path == "/_query?format=txt"
+        and '"FROM test | EVAL c = CONCAT(x::keyword, \\": \\", message)'
+        ' | WHERE x > 1 AND c LIKE \\"*G*\\""' in body,
+        f"req={req}",
+    )
+
+    req = esql.parse_curl_command(
+        "curl --silent -k --max-time 5 -o /tmp/out 'http://es:9200/_cat/indices?v'"
+    )
+    check(
+        "no-arg flags + value flags are skipped without confusing URL detection",
+        req.method == "GET" and req.path == "/_cat/indices?v",
+        f"req={req}",
+    )
+
+    req = esql.parse_curl_command("curl -X POST /_query -d '{}'")
+    check(
+        "absolute path with no host is kept as-is",
+        req.method == "POST" and req.path == "/_query" and req.body == "{}",
+        f"req={req}",
+    )
+
+    req = esql.parse_curl_command(
+        "curl -X PUT 'http://es:9200/sample/_bulk' -d '{\"index\":{}}\\n{\"x\":1}'"
+    )
+    check(
+        "_bulk body is normalized to end with a trailing newline",
+        req.path == "/sample/_bulk" and (req.body or "").endswith("\n"),
+        f"req={req}",
+    )
+
+    try:
+        esql.parse_curl_command("curl -u elastic:password")
+    except ValueError as exc:
+        check(
+            "missing URL raises ValueError",
+            "missing URL" in str(exc),
+            str(exc),
+        )
+    else:
+        check("missing URL raises ValueError", False)
+
+
+def test_parse_rest_requests_with_curl() -> None:
+    section("parse_rest_requests with curl blocks")
+
+    script = (
+        "curl -u elastic:password "
+        '-H "Content-Type: application/json" '
+        '"127.0.0.1:9200/_query?format=txt" -d \'\n'
+        '{\n'
+        '  "query":\n'
+        '    "FROM test | EVAL c = CONCAT(x::keyword, \\": \\", message)'
+        ' | WHERE x > 1 AND c LIKE \\"*G*\\""\n'
+        '}\n'
+        "'\n"
+    )
+    requests = esql.parse_rest_requests(script)
+    check("single curl block parses to one request", len(requests) == 1, f"requests={requests}")
+    if requests:
+        req = requests[0]
+        check("curl block: POST /_query?format=txt",
+              req.method == "POST" and req.path == "/_query?format=txt", f"req={req}")
+        check("curl block: body retains escaped JSON content",
+              req.body is not None and 'CONCAT(x::keyword, \\": \\"' in req.body, f"body={req.body!r}")
+
+    mixed = (
+        "PUT sample_data\n"
+        '{ "settings": {} }\n'
+        "\n"
+        "curl -X DELETE 'http://es:9200/sample_data'\n"
+        "\n"
+        "GET /_cluster/health\n"
+    )
+    requests = esql.parse_rest_requests(mixed)
+    check(
+        "curl blocks interleave cleanly with Dev Tools blocks",
+        [r.method for r in requests] == ["PUT", "DELETE", "GET"]
+        and [r.path for r in requests] == ["sample_data", "/sample_data", "/_cluster/health"],
+        f"requests={requests}",
+    )
+
+    backslash_continued = (
+        "curl -X POST 'http://es:9200/_query' \\\n"
+        "  -H 'Content-Type: application/json' \\\n"
+        "  -d '{\"query\":\"FROM logs\"}'\n"
+    )
+    requests = esql.parse_rest_requests(backslash_continued)
+    check(
+        "backslash line continuation joins curl across lines",
+        len(requests) == 1
+        and requests[0].method == "POST"
+        and requests[0].path == "/_query"
+        and requests[0].body == '{"query":"FROM logs"}',
+        f"requests={requests}",
+    )
+
+    try:
+        esql.parse_rest_requests("curl -u no-url-here\n")
+    except ValueError as exc:
+        check(
+            "invalid curl block raises ValueError with line number",
+            "Invalid curl command at line 1" in str(exc),
+            str(exc),
+        )
+    else:
+        check("invalid curl block raises ValueError with line number", False)
+
+
 def test_extract_line_col_errors() -> None:
     section("extract_line_col_errors")
 
@@ -902,6 +1065,67 @@ PUT sample_data/_bulk
         httpd.shutdown()
 
 
+def test_e2e_rest_curl_command_pipe() -> None:
+    section("end-to-end: --rest with curl command")
+    seen: list[tuple[str, str, str | None, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_k): pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            seen.append((self.command, self.path, self.headers.get("Content-Type"), body))
+            payload = json.dumps({"columns": [{"name": "n"}], "values": [[1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address
+    url = f"http://{host}:{port}"
+    try:
+        script = (
+            "curl -u elastic:password "
+            '-H "Content-Type: application/json" '
+            '"127.0.0.1:9200/_query?format=txt" -d \'\n'
+            "{\n"
+            '  "query":\n'
+            '    "FROM test | EVAL c = CONCAT(x::keyword, \\": \\", message)'
+            ' | WHERE x > 1 AND c LIKE \\"*G*\\""\n'
+            "}\n"
+            "'\n"
+        )
+        proc = run_cli(url, script, "--rest")
+        check("exit 0", proc.returncode == 0, proc.stderr.decode())
+        check("server saw exactly one request", len(seen) == 1, f"seen={seen}")
+        if seen:
+            method, path, content_type, body = seen[0]
+            check("curl POST routed to /_query?format=txt",
+                  method == "POST" and path == "/_query?format=txt", f"got={method} {path}")
+            check("content-type is application/json",
+                  (content_type or "").startswith("application/json"), f"ct={content_type!r}")
+            try:
+                payload = json.loads(body)
+                got_query = payload.get("query", "")
+            except json.JSONDecodeError:
+                got_query = ""
+            expected_query = (
+                'FROM test | EVAL c = CONCAT(x::keyword, ": ", message)'
+                ' | WHERE x > 1 AND c LIKE "*G*"'
+            )
+            check(
+                "JSON body decoded to the expected ES|QL query",
+                got_query == expected_query,
+                f"got={got_query!r}",
+            )
+    finally:
+        httpd.shutdown()
+
+
 def test_e2e_rest_repl_mode_and_go() -> None:
     section("end-to-end: --rest REPL mode + \\g")
     seen: list[tuple[str, str, str]] = []
@@ -1385,6 +1609,8 @@ def test_e2e_cli_connection_options() -> None:
 def main() -> int:
     test_splitter()
     test_unwrap_escaped_query()
+    test_parse_curl_command()
+    test_parse_rest_requests_with_curl()
     test_parse_rest_requests()
     test_extract_line_col_errors()
     test_render_query_pointer()
@@ -1412,6 +1638,7 @@ def main() -> int:
     test_e2e_unwrap_escaped_query_pipe()
     test_e2e_set_clause_stays_with_query()
     test_e2e_rest_request_mode()
+    test_e2e_rest_curl_command_pipe()
     test_e2e_rest_repl_mode_and_go()
     test_e2e_set_and_substitute()
     test_e2e_show_functions_via_slash_df()
