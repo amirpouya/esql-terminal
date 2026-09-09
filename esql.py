@@ -87,11 +87,20 @@ except ImportError:
 
 
 ESQL_KEYWORDS = (
-    "FROM", "TS", "WHERE", "LIMIT", "SORT", "STATS", "EVAL", "KEEP", "DROP", "RENAME",
-    "ROW", "DISSECT", "GROK", "ENRICH", "MV_EXPAND", "CHANGE_POINT", "LOOKUP", "JOIN",
-    "SHOW", "META", "EXPLAIN", "IN", "NOT", "AND", "OR", "BY", "AS", "NULL", "IS",
-    "LIKE", "RLIKE", "MATCH", "CASE", "WHEN", "THEN", "ELSE", "END", "TRUE", "FALSE",
-    "SET", "TBUCKET",
+    # Source commands and directives
+    "FROM", "TS", "ROW", "SHOW", "PROMQL", "SET", "EXPLAIN", "META",
+    # Processing commands
+    "WHERE", "EVAL", "STATS", "INLINE", "INLINESTATS", "KEEP", "DROP", "RENAME",
+    "SORT", "LIMIT", "DISSECT", "GROK", "ENRICH", "MV_EXPAND", "LOOKUP", "JOIN",
+    "CHANGE_POINT", "FORK", "FUSE", "RERANK", "COMPLETION", "SAMPLE", "HIGHLIGHT",
+    "METRICS_INFO", "TS_INFO", "TS_COLLAPSE", "URI_PARTS", "USER_AGENT",
+    "REGISTERED_DOMAIN", "MMR", "DEDUP", "IP_LOCATION",
+    # Clauses and operators
+    "IN", "NOT", "AND", "OR", "BY", "AS", "ON", "WITH", "METADATA",
+    "NULL", "NULLS", "IS", "LIKE", "RLIKE", "MATCH",
+    "ASC", "DESC", "TRUE", "FALSE",
+    "CASE", "WHEN", "THEN", "ELSE", "END",
+    "TBUCKET", "WITHOUT",
 )
 ESQL_KEYWORDS_SET = set(ESQL_KEYWORDS)
 ESQL_KEYWORD_PATTERN = r"(?i)\b(?:%s)\b" % "|".join(re.escape(keyword) for keyword in ESQL_KEYWORDS)

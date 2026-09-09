@@ -1397,6 +1397,24 @@ def test_uppercase_esql_keywords() -> None:
         f"out={out!r}",
     )
 
+    out = esql.uppercase_esql_keywords(
+        "from logs metadata _id | lookup join users on user.id | inline stats c = count(*) by service"
+    )
+    check(
+        "newer commands and clauses capitalized",
+        out == "FROM logs METADATA _id | LOOKUP JOIN users ON user.id | INLINE STATS c = count(*) BY service",
+        f"out={out!r}",
+    )
+
+    out = esql.uppercase_esql_keywords(
+        "promql index=k8s step=1m cost=(sum(rate(network.cost))) | ts_collapse | sample 0.1"
+    )
+    check(
+        "promql, ts_collapse, and sample capitalized",
+        out == "PROMQL index=k8s step=1m cost=(sum(rate(network.cost))) | TS_COLLAPSE | SAMPLE 0.1",
+        f"out={out!r}",
+    )
+
 
 def test_e2e_set_and_substitute() -> None:
     section("end-to-end: \\set + variable substitution via \\g")
